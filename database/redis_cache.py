@@ -176,10 +176,12 @@ class AsyncHybridCache:
                     self._available = False
         else:
             await self._try_reconnect()
-        return False
+        # BUG FIX: in-memory write above always succeeds, so return True
+        return True
 
     async def delete(self, key: str) -> bool:
         """Delete a single key from both Redis and in-memory cache."""
+        was_in_memory = key in self._memory_cache
         self._memory_cache.pop(key, None)
 
         if self._available:
@@ -191,7 +193,8 @@ class AsyncHybridCache:
                 if "Timeout" in str(e) or "Connection" in str(e):
                     self._last_fail_time = time.time()
                     self._available = False
-        return False
+        # BUG FIX: return True if the key existed and was removed from memory cache
+        return was_in_memory
 
     async def flush_pattern(self, pattern: str) -> int:
         """
@@ -229,10 +232,16 @@ class AsyncHybridCache:
         """Return remaining TTL in seconds. -1 if no TTL, -2 if not found."""
         if not self._available:
             entry = self._memory_cache.get(key)
-            if entry and entry["expires_at"]:
-                remaining = int(entry["expires_at"] - time.time())
-                return max(remaining, 0)
-            return -2
+            if entry is None:
+                return -2  # key not found
+            if entry["expires_at"] is None:
+                # BUG FIX: key exists but has no expiry — return -1, not -2
+                return -1
+            remaining = int(entry["expires_at"] - time.time())
+            if remaining <= 0:
+                del self._memory_cache[key]
+                return -2  # expired
+            return remaining
         try:
             return await self._redis.ttl(key)
         except Exception:
@@ -307,4 +316,4 @@ class AsyncHybridCache:
 
 
 # ── Singleton Instance ────────────────────────────────────────────────────────
-cache = AsyncHybridCache()
+cache = AsyncHybridCache()  

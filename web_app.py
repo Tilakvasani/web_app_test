@@ -6,11 +6,23 @@ configures CORS middleware policies, and initializes logging.
 """
 
 import logging
+import logging.handlers
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routes import state_router, oauth_router, chat_router
 from database import cache
+
+# BUG FIX: configure logging with a file handler so app.log is actually written.
+# Without this, the /api/logs endpoint always returns "Log file app.log does not exist yet."
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("app.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ]
+)
 
 # Setup logger configuration to format app.log cleanly
 logger = logging.getLogger("mcp_backend")

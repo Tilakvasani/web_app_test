@@ -48,7 +48,8 @@ async def index_documents_in_redis(loaded_docs: Dict[str, Any]):
     try:
         cursor = 0
         while True:
-            cursor, keys = await client.scan(cursor, match="doc:chunk:*", count=100)
+            # BUG FIX: use correct "mcp:doc:chunk:*" prefix to match KEY_DOC_CHUNK constant
+            cursor, keys = await client.scan(cursor, match="mcp:doc:chunk:*", count=100)
             if keys:
                 await client.delete(*keys)
             if cursor == 0:
@@ -82,7 +83,8 @@ async def index_documents_in_redis(loaded_docs: Dict[str, Any]):
             # Store chunks and vectors in Redis using pipeline
             pipeline = client.pipeline()
             for idx, (chunk, vec) in enumerate(zip(chunks, chunk_embeddings)):
-                key = f"doc:chunk:{doc_name}:{idx}"
+                # BUG FIX: use "mcp:doc:chunk:..." prefix to match KEY_DOC_CHUNK constant
+                key = f"mcp:doc:chunk:{doc_name}:{idx}"
                 pipeline.hset(key, mapping={
                     "text": chunk,
                     "url": url,
@@ -114,23 +116,33 @@ async def vector_search_redis(query: str, top_k: int = 3) -> List[Dict[str, Any]
         keys = []
         cursor = 0
         while True:
-            cursor, batch = await client.scan(cursor, match="doc:chunk:*", count=100)
+            # BUG FIX: use correct "mcp:doc:chunk:*" prefix to match KEY_DOC_CHUNK constant
+            cursor, batch = await client.scan(cursor, match="mcp:doc:chunk:*", count=100)
             keys.extend(batch)
             if cursor == 0:
                 break
 
         if not keys:
             return []
-            
-        candidates = []
+
+        # BUG FIX: use a pipeline to batch all hgetall calls — avoids N+1 Redis round-trips
+        pipeline = client.pipeline()
         for key in keys:
-            data = await client.hgetall(key)
+            pipeline.hgetall(key)
+        all_data = await pipeline.execute()
+
+        candidates = []
+        query_norm = np.linalg.norm(query_vec)
+        for data in all_data:
             if not data or "vector" not in data:
                 continue
-            
+
             vec = json.loads(data["vector"])
-            # Calculate cosine similarity: dot(A, B) / (norm(A) * norm(B))
-            similarity = np.dot(query_vec, vec) / (np.linalg.norm(query_vec) * np.linalg.norm(vec))
+            vec_norm = np.linalg.norm(vec)
+            # BUG FIX: guard against division by zero when either vector has zero norm
+            if query_norm == 0 or vec_norm == 0:
+                continue
+            similarity = np.dot(query_vec, vec) / (query_norm * vec_norm)
             candidates.append({
                 "text": data.get("text", ""),
                 "url": data.get("url", ""),
@@ -154,8 +166,9 @@ async def retrieve_relevant_tools(query: str, tools: List[Any], top_k: int = 7) 
     if not tools:
         return []
         
-    # If we have fewer or equal tools than top_k, no need to filter!
-    if len(tools) <= top_k:
+    # To prevent rate-limits (HTTP 429) and network overhead on small/medium toolsets, 
+    # only perform semantic filtering if the total tool count is larger than 15.
+    if len(tools) <= 15:
         return tools
 
     try:
@@ -224,4 +237,3 @@ async def retrieve_relevant_tools(query: str, tools: List[Any], top_k: int = 7) 
     except Exception as err:
         logger.error(f"[TOOL RAG ERROR] Semantic tool retrieval failed: {err}. Gracefully falling back to all tools.")
         return tools
-

@@ -87,14 +87,15 @@ async def compress_history_sandwich(
 
     # Compute a unique key for the middle slice using MD5
     middle_hash = hashlib.md5(middle_text.encode("utf-8")).hexdigest()
-    cache_key = f"summary:{len(middle_slice)}:{middle_hash}"
-    cached_summary = await cache.get(cache_key)
+    # BUG FIX: use the cache helper so the key follows the "mcp:history:*" prefix convention,
+    # making it visible to cache_stats() and invalidate_all()
+    cached_summary = await cache.get_history_summary(middle_hash)
     
     if cached_summary:
-        logger.info(f"[HISTORY COMPRESS] Middle summary found in cache (Key: {cache_key})!")
+        logger.info(f"[HISTORY COMPRESS] Middle summary found in cache (Hash: {middle_hash})!")
         summary_paragraph = cached_summary
     else:
-        logger.info(f"[HISTORY COMPRESS] Summary cache miss. Requesting LLM summarization (Key: {cache_key})...")
+        logger.info(f"[HISTORY COMPRESS] Summary cache miss. Requesting LLM summarization (Hash: {middle_hash})...")
         summary_prompt = (
             "Generate a brief, high-level summary of the following conversation segment, highlighting the key questions asked, decisions made, and actions performed.\n"
             "Be extremely concise, wrapping everything in a single, dense paragraph.\n\n"
@@ -104,8 +105,8 @@ async def compress_history_sandwich(
         try:
             summary_res = await llm_inst.ainvoke([SystemMessage(content=summary_prompt)])
             summary_paragraph = summary_res.content if hasattr(summary_res, "content") else str(summary_res)
-            # Store summary in cache for 1 hour (3600 seconds)
-            await cache.set(cache_key, summary_paragraph.strip(), ttl=3600)
+            # BUG FIX: use set_history_summary so the key is "mcp:history:{hash}" (TTL = 1 hour)
+            await cache.set_history_summary(middle_hash, summary_paragraph.strip())
         except Exception as e:
             logger.error(f"[HISTORY COMPRESS ERROR] Summarization failed: {e}")
             summary_paragraph = "Middle conversation segment summarized."

@@ -32,7 +32,9 @@ def _get_tool_cache_key(tool_name: str, kwargs: dict) -> str:
     """Generates a unique cache key for a tool invocation based on name + arguments."""
     args_str = str(sorted(kwargs.items()))
     args_hash = hashlib.md5(args_str.encode("utf-8")).hexdigest()
-    return f"tool_resp:{tool_name}:{args_hash}"
+    # BUG FIX: use "mcp:tool_resp:*" prefix to match KEY_TOOL_RESPONSE constant in
+    # redis_cache.py so cache_stats() counts them and invalidate_tool_cache() clears them
+    return f"mcp:tool_resp:{tool_name}:{args_hash}"
 
 def wrap_tool_with_coercion(tool_inst: BaseTool) -> BaseTool:
     """
@@ -98,6 +100,14 @@ def wrap_tool_with_coercion(tool_inst: BaseTool) -> BaseTool:
                         res = await tool_inst.ainvoke(new_kwargs)
                         logger.info(f"[TOOL SUCCESS] Coerced retry of '{tool_inst.name}' completed successfully.")
                         res = _truncate_tool_output(res, tool_inst.name)
+                        # BUG FIX: cache the coerced result so the same args don't repeat
+                        # the error + coercion cycle on every identical call
+                        if cache_key:
+                            try:
+                                from database import cache
+                                await cache.set(cache_key, str(res), ttl=300)
+                            except Exception:
+                                pass
                         return res
                     except Exception as retry_err:
                         logger.error(f"[COERCION FAIL] Coerced retry of '{tool_inst.name}' also failed: {retry_err}")
@@ -409,8 +419,31 @@ def web_scrape(url: str) -> str:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(f"# Scraped Content from: {url}\n\n{scraped_text}")
         logger.info(f"[WORKSPACE SAVE] Saved scraped page content to '{file_path}'")
+
+        # BUG FIX: register the scraped file in state so it appears in /files and the
+        # agent can reference it in future turns — previously it was saved to disk but
+        # never added to state["uploaded_files"]
+        try:
+            import time as _time
+            from database.state_manager import load_state, save_state
+            state_data = load_state()
+            if "uploaded_files" not in state_data:
+                state_data["uploaded_files"] = []
+            # Replace any stale entry with the same filename
+            state_data["uploaded_files"] = [
+                f for f in state_data["uploaded_files"] if f.get("name") != safe_filename
+            ]
+            state_data["uploaded_files"].append({
+                "name": safe_filename,
+                "path": os.path.abspath(file_path),
+                "size": len(scraped_text.encode("utf-8")),
+                "uploaded_at": _time.time()
+            })
+            save_state(state_data)
+            logger.info(f"[WORKSPACE SAVE] Registered '{safe_filename}' in workspace state.")
+        except Exception as state_err:
+            logger.error(f"[WORKSPACE SAVE ERROR] Failed to register scraped file in state: {state_err}")
     except Exception as save_err:
         logger.error(f"[WORKSPACE SAVE ERROR] Failed to save scraped file: {save_err}")
 
     return f"Successfully scraped '{url}'! Content saved to your workspace as '{safe_filename}'.\n\nPreview of Scraped Content:\n\n{scraped_text[:1200]}..."
-

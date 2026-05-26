@@ -138,14 +138,18 @@ async def chat_interaction(body: ChatRequest):
                     success = True
         except Exception as stream_err:
             logger.error(f"[CHAT STREAM ERROR] Stream generation wrapper failed: {stream_err}")
-        finally:
-            # The finally block ALWAYS executes, even on Starlette cancellation / GeneratorExit
-            if success and cache_key and chunks_collected:
-                try:
-                    await cache.set(cache_key, chunks_collected, ttl=600)
-                    logger.info(f"[CHAT CACHE STORE] Cached new response under hash '{req_hash}'.")
-                except Exception as cache_set_err:
-                    logger.error(f"[CHAT CACHE ERROR] Failed to store response in cache: {cache_set_err}")
+
+        # BUG FIX: moved caching OUT of the finally block.
+        # Using `await` inside `finally` of an async generator raises
+        # RuntimeError: "async generator ignored GeneratorExit" when Starlette
+        # cancels the generator on client disconnect. Caching here is safe and
+        # correct — partial/failed streams (success=False) are never cached anyway.
+        if success and cache_key and chunks_collected:
+            try:
+                await cache.set(cache_key, chunks_collected, ttl=600)
+                logger.info(f"[CHAT CACHE STORE] Cached new response under hash '{req_hash}'.")
+            except Exception as cache_set_err:
+                logger.error(f"[CHAT CACHE ERROR] Failed to store response in cache: {cache_set_err}")
 
     return StreamingResponse(sse_stream_wrapper(), media_type="text/event-stream")
 
@@ -230,7 +234,7 @@ async def execute_command(body: CommandRequest):
         elif cmd == "/files":
             files = state.get("uploaded_files", [])
             if not files:
-                return {"status": "success", "content": "📂 **Workspace workspace directory is currently empty.**"}
+                return {"status": "success", "content": "📂 **Workspace directory is currently empty.**"}
             
             files_md = "### 📂 Local Workspace Files:\n\n"
             files_md += "| Filename | Format | Size (KB) |\n| :--- | :--- | :--- |\n"
@@ -455,7 +459,9 @@ async def execute_command(body: CommandRequest):
                 safe_name = f"notion_page_{record_id}.md"
                 file_path = os.path.join(UPLOAD_DIR, safe_name)
                 with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(f"# Exported Notion Page: {record_id}\n\n```json\n{json.dumps(notion_res, indent=2)}\n```")
+                    # BUG FIX: added default=str to handle non-serializable Pydantic/object
+                    # responses from Notion MCP — without it json.dumps raises TypeError
+                    f.write(f"# Exported Notion Page: {record_id}\n\n```json\n{json.dumps(notion_res, indent=2, default=str)}\n```")
                 
                 # Sync dynamic state to register new file
                 file_size = os.path.getsize(file_path)
@@ -537,5 +543,3 @@ async def execute_command(body: CommandRequest):
     except Exception as cmd_err:
         logger.error(f"[COMMAND ERROR] Command '{command_str}' failed: {cmd_err}", exc_info=True)
         return {"status": "error", "content": f"❌ **Failed to execute command '{cmd}': {str(cmd_err)}**"}
-
-

@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+openai
+langchain-openai
+langchain-mcp-adapters
+langgraph
+streamlit
+httpx
+pypdf
+python-docx
+tiktoken

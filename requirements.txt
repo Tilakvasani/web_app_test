@@ -10,3 +10,6 @@ httpx
 pypdf
 python-docx
 tiktoken
+redis[hiredis]
+numpy
+anyio==3.7.1

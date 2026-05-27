@@ -14,11 +14,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from routes import state_router, oauth_router, chat_router
 from database import cache
 
+import os
+os.makedirs(".logs", exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler("app.log", encoding="utf-8"),
+        logging.FileHandler(os.path.join(".logs", "app.log"), encoding="utf-8"),
         logging.StreamHandler(),
     ]
 )
@@ -31,7 +34,7 @@ async def _token_refresh_loop():
     """
     FIX: Proactive token refresh runs in a background asyncio task every 55 minutes.
     Previously this ran inline at the top of every /api/chat request, adding
-    400–700 ms latency when a refresh was due. Moving it here means zero chat
+    400-700 ms latency when a refresh was due. Moving it here means zero chat
     request overhead — tokens are always fresh in the background.
     """
     # Import here to avoid circular import at module level
@@ -114,4 +117,10 @@ logger.info("FastAPI Backend routes successfully loaded.")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("web_app:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run(
+        "web_app:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+        reload_excludes=["*.log", "mcp_state.json", "oauth_flows.json", "uploaded_files/*", "uploaded_files"]
+    )

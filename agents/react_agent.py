@@ -321,7 +321,7 @@ async def stream_agent_interaction(
     # ── 4. Strategic Planning Phase ──
     if needs_plan:
         logger.info("[PLANNER] Running pre-execution strategic planning call...")
-        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Creating strategic execution plan...'})}\\n\\n"
+        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Creating strategic execution plan...'})}\n\n"
 
         try:
             planning_system_prompt = (
@@ -353,7 +353,7 @@ async def stream_agent_interaction(
                 total_output_tokens += count_tokens(plan_response.content)
 
             plan_text = plan_response.content if hasattr(plan_response, "content") else str(plan_response)
-            yield f"event: thought\ndata: {json.dumps({'text': f'📋 **Strategic Execution Plan Created**:\\n{plan_text}'})}\\n\\n"
+            yield f"event: thought\ndata: {json.dumps({'text': f'📋 **Strategic Execution Plan Created**:\\n{plan_text}'})}\n\n"
         except Exception as plan_err:
             logger.error(f"[PLANNER ERROR] Strategic planning call failed: {plan_err}")
             plan_text = "Step 1: Directly process request using available tools."
@@ -385,7 +385,7 @@ async def stream_agent_interaction(
 
     logger.info("[AGENT EXECUTE] Initializing LangGraph ReAct agent stream...")
     if needs_plan:
-        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Starting plan execution with dynamic tools...'})}\\n\\n"
+        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Starting plan execution with dynamic tools...'})}\n\n"
 
     try:
         if tools:
@@ -401,17 +401,17 @@ async def stream_agent_interaction(
                             for tc in msg.tool_calls:
                                 logger.info(f"[AGENT THOUGHT] Calling tool: {tc['name']}")
                                 logger.info(f"[TOOL INVOKE] Calling tool '{tc['name']}' with arguments: {tc['args']}")
-                                yield f"event: tool_call\ndata: {json.dumps({'name': tc['name'], 'args': tc['args']})}\\n\\n"
+                                yield f"event: tool_call\ndata: {json.dumps({'name': tc['name'], 'args': tc['args']})}\n\n"
 
                         if hasattr(msg, "content") and msg.content:
                             logger.info(f"[AGENT CHUNK] Assistant text chunk returned.")
-                            yield f"event: content\ndata: {json.dumps({'text': msg.content})}\\n\\n"
+                            yield f"event: content\ndata: {json.dumps({'text': msg.content})}\n\n"
 
                 elif "tools" in chunk:
                     for msg in chunk["tools"]["messages"]:
                         logger.info(f"[TOOL RESPONSE] Tool response captured for: {msg.name}")
                         logger.info(f"[TOOL SUCCESS] Tool '{msg.name}' successfully returned output.")
-                        yield f"event: tool_output\ndata: {json.dumps({'name': msg.name, 'content': str(msg.content)})}\\n\\n"
+                        yield f"event: tool_output\ndata: {json.dumps({'name': msg.name, 'content': str(msg.content)})}\n\n"
         else:
             logger.info("[CHAT] No tools loaded. Streaming chat response directly from LLM...")
             full_msgs = [SystemMessage(content=system_prompt)] + msgs
@@ -421,14 +421,14 @@ async def stream_agent_interaction(
             async for token_chunk in llm_inst.astream(full_msgs):
                 if token_chunk.content:
                     full_response += token_chunk.content
-                    yield f"event: content\ndata: {json.dumps({'text': token_chunk.content})}\\n\\n"
+                    yield f"event: content\ndata: {json.dumps({'text': token_chunk.content})}\n\n"
             total_output_tokens += count_tokens(full_response)
 
-        yield f"event: token_usage\ndata: {json.dumps({'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens})}\\n\\n"
-        yield f"event: thought\ndata: {json.dumps({'text': '✅ Completed successfully'})}\\n\\n"
+        yield f"event: token_usage\ndata: {json.dumps({'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens})}\n\n"
+        yield f"event: thought\ndata: {json.dumps({'text': '✅ Completed successfully'})}\n\n"
 
     except Exception as e:
         logger.error(f"[CHAT ERROR] Streaming execution encountered error: {e}", exc_info=True)
         from routes.state_routes import unpack_exception
         clean_msg = unpack_exception(e)
-        yield f"event: error\ndata: {json.dumps({'message': clean_msg})}\\n\\n"
+        yield f"event: error\ndata: {json.dumps({'message': clean_msg})}\n\n"

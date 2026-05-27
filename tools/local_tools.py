@@ -31,7 +31,7 @@ def _truncate_tool_output(result: Any, tool_name: str) -> Any:
 def _get_tool_cache_key(tool_name: str, kwargs: dict) -> str:
     """Generates a unique cache key for a tool invocation based on name + arguments."""
     args_str = str(sorted(kwargs.items()))
-    args_hash = hashlib.md5(args_str.encode("utf-8")).hexdigest()
+    args_hash = hashlib.sha256(args_str.encode("utf-8")).hexdigest()[:32]
     # BUG FIX: use "mcp:tool_resp:*" prefix to match KEY_TOOL_RESPONSE constant in
     # redis_cache.py so cache_stats() counts them and invalidate_tool_cache() clears them
     return f"mcp:tool_resp:{tool_name}:{args_hash}"

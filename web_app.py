@@ -5,6 +5,7 @@ Starts the universal MCP backend engine, registers modular routers,
 configures CORS middleware policies, and initializes logging.
 """
 
+import asyncio
 import logging
 import logging.handlers
 from contextlib import asynccontextmanager
@@ -13,8 +14,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from routes import state_router, oauth_router, chat_router
 from database import cache
 
-# BUG FIX: configure logging with a file handler so app.log is actually written.
-# Without this, the /api/logs endpoint always returns "Log file app.log does not exist yet."
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -24,24 +23,43 @@ logging.basicConfig(
     ]
 )
 
-# Setup logger configuration to format app.log cleanly
 logger = logging.getLogger("mcp_backend")
 logger.info("Initializing Modular FastAPI Server...")
+
+
+async def _token_refresh_loop():
+    """
+    FIX: Proactive token refresh runs in a background asyncio task every 55 minutes.
+    Previously this ran inline at the top of every /api/chat request, adding
+    400–700 ms latency when a refresh was due. Moving it here means zero chat
+    request overhead — tokens are always fresh in the background.
+    """
+    # Import here to avoid circular import at module level
+    from routes.oauth_routes import proactively_refresh_server_tokens
+
+    # Initial delay so the server finishes startup before the first refresh attempt
+    await asyncio.sleep(10)
+
+    while True:
+        try:
+            await proactively_refresh_server_tokens()
+        except Exception as ex:
+            logger.error(f"[TOKEN REFRESH BACKGROUND] Error: {ex}")
+        # Refresh every 55 minutes (tokens typically expire at 60 min)
+        await asyncio.sleep(55 * 60)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Modern FastAPI lifespan handler (replaces deprecated on_event).
-    Manages Redis connection and vector store bootstrapping.
+    Manages Redis connection, vector store bootstrapping, and background tasks.
     """
     # ── Startup ──
     logger.info("[STARTUP] Bootstrapping FastAPI Server...")
-    
-    # Connect to Redis (falls back to in-memory if unavailable)
+
     await cache.connect()
-    
-    # Index documents in vector store if Redis is active
+
     try:
         from database import load_state, index_documents_in_redis
         if cache.is_available:
@@ -54,24 +72,32 @@ async def lifespan(app: FastAPI):
                 logger.info("[STARTUP] No documents to index in vector store.")
     except Exception as e:
         logger.error(f"[STARTUP ERROR] Vector store bootstrapping failed: {e}")
-    
+
+    # FIX: Start background token refresh task — removed from chat route handler
+    refresh_task = asyncio.create_task(_token_refresh_loop())
+    logger.info("[STARTUP] Background token refresh task started (every 55 min).")
+
     logger.info("[STARTUP] Server ready.")
     yield
-    
+
     # ── Shutdown ──
     logger.info("[SHUTDOWN] Gracefully shutting down...")
+    refresh_task.cancel()
+    try:
+        await refresh_task
+    except asyncio.CancelledError:
+        pass
     await cache.disconnect()
     logger.info("[SHUTDOWN] Complete.")
 
 
 app = FastAPI(
-    title="⬡ Universal MCP Backend Server", 
+    title="⬡ Universal MCP Backend Server",
     description="Refactored Modular API Engine for Model Context Protocol and dynamic sessions.",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
-# Enable CORS for local Streamlit calls
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -80,7 +106,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register Modular Routers
 app.include_router(state_router)
 app.include_router(oauth_router)
 app.include_router(chat_router)

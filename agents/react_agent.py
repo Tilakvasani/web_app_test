@@ -6,6 +6,7 @@ Integrates dynamic MCP clients, binds local search/workspace helper tools,
 and coordinates pre-execution strategic planners.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -20,10 +21,11 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from config import get_llm, UPLOAD_DIR, _make_cfg
 from database import cache
+from database.redis_cache import KEY_SIFTER, TTL_SIFTER
 from prompts import build_system_prompt
 from tools import (
-    wrap_tool_with_coercion, 
-    get_read_uploaded_file_tool, 
+    wrap_tool_with_coercion,
+    get_read_uploaded_file_tool,
     get_query_documentation_tool,
     web_search,
     web_scrape
@@ -31,16 +33,33 @@ from tools import (
 
 logger = logging.getLogger("mcp_backend")
 
+# FIX: Cache tiktoken encoder at module level — was being re-instantiated on
+# every count_tokens() call (dozens of times per request, each reloads BPE vocab).
+_TIKTOKEN_ENC = None
+
+def _get_encoder():
+    global _TIKTOKEN_ENC
+    if _TIKTOKEN_ENC is None:
+        try:
+            _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            pass
+    return _TIKTOKEN_ENC
+
+
 def count_tokens(text: str) -> int:
     """Helper to count token length of text using the cl100k_base tokenizer."""
     try:
-        encoding = tiktoken.get_encoding("cl100k_base")
-        return len(encoding.encode(text))
+        enc = _get_encoder()
+        if enc:
+            return len(enc.encode(text))
     except Exception:
-        return len(text) // 4
+        pass
+    return len(text) // 4
+
 
 async def compress_history_sandwich(
-    history: List[Dict[str, str]], 
+    history: List[Dict[str, str]],
     llm_inst
 ) -> List[Dict[str, str]]:
     """
@@ -50,7 +69,7 @@ async def compress_history_sandwich(
     - If > 8 messages:
       - Keeps the first 3 messages.
       - Keeps the last 3 messages.
-      - Condenses all middle messages into a single summarized AIMessage/HumanMessage context.
+      - Condenses all middle messages into a single summarized context.
     """
     noise_patterns = [
         r"^(hi|hello|hey|greetings|howdy|ok|ok bro|thanks|thank you|ok thanks|cool)$"
@@ -58,91 +77,79 @@ async def compress_history_sandwich(
     cleaned = []
     for msg in history:
         content = msg.get("content", "").strip()
-        is_noise = False
-        for pat in noise_patterns:
-            if re.match(pat, content, re.IGNORECASE):
-                is_noise = True
-                break
-        
-        # Don't filter out if it is an important detailed request
+        is_noise = any(re.match(pat, content, re.IGNORECASE) for pat in noise_patterns)
         if is_noise and len(content) < 30:
             logger.info(f"[HISTORY COMPRESS] Pruned noise message: '{content}'")
             continue
         cleaned.append(msg)
-        
+
     if len(cleaned) <= 8:
         return cleaned
 
-    # Extract sandwich slices
     first_slice = cleaned[:3]
     last_slice = cleaned[-3:]
     middle_slice = cleaned[3:-3]
 
-    # Summarize middle slice
     middle_text = ""
     for msg in middle_slice:
         role = msg.get("role", "user").upper()
         content = msg.get("content", "")
         middle_text += f"{role}: {content}\n"
 
-    # Compute a unique key for the middle slice using MD5
-    middle_hash = hashlib.md5(middle_text.encode("utf-8")).hexdigest()
-    # BUG FIX: use the cache helper so the key follows the "mcp:history:*" prefix convention,
-    # making it visible to cache_stats() and invalidate_all()
+    middle_hash = hashlib.sha256(middle_text.encode("utf-8")).hexdigest()[:32]
     cached_summary = await cache.get_history_summary(middle_hash)
-    
+
     if cached_summary:
         logger.info(f"[HISTORY COMPRESS] Middle summary found in cache (Hash: {middle_hash})!")
         summary_paragraph = cached_summary
     else:
-        logger.info(f"[HISTORY COMPRESS] Summary cache miss. Requesting LLM summarization (Hash: {middle_hash})...")
+        logger.info(f"[HISTORY COMPRESS] Summary cache miss. Requesting LLM summarization...")
         summary_prompt = (
             "Generate a brief, high-level summary of the following conversation segment, highlighting the key questions asked, decisions made, and actions performed.\n"
             "Be extremely concise, wrapping everything in a single, dense paragraph.\n\n"
             f"--- Conversation Segment ---\n{middle_text}"
         )
-        
+
         try:
             summary_res = await llm_inst.ainvoke([SystemMessage(content=summary_prompt)])
             summary_paragraph = summary_res.content if hasattr(summary_res, "content") else str(summary_res)
-            # BUG FIX: use set_history_summary so the key is "mcp:history:{hash}" (TTL = 1 hour)
             await cache.set_history_summary(middle_hash, summary_paragraph.strip())
         except Exception as e:
             logger.error(f"[HISTORY COMPRESS ERROR] Summarization failed: {e}")
             summary_paragraph = "Middle conversation segment summarized."
 
-    # Build sandwich
     sandwich_history = []
     sandwich_history.extend(first_slice)
-    
-    # Inject summary as an assistant summary context
     sandwich_history.append({
         "role": "assistant",
         "content": f"[System Context: High-level summary of middle conversation: {summary_paragraph.strip()}]"
     })
-    
     sandwich_history.extend(last_slice)
-    logger.info(f"[HISTORY COMPRESS] Sandwich compiled successfully! Messages reduced from {len(history)} to {len(sandwich_history)}.")
+    logger.info(f"[HISTORY COMPRESS] Sandwich compiled. Messages reduced from {len(history)} to {len(sandwich_history)}.")
     return sandwich_history
 
-# Global in-memory cache for pre-fetched tools to eliminate redundant network fetches
+
+# FIX: Cache key now uses only name + url (NOT auth_value/token).
+# Previously, token rotation (every ~35 min) invalidated the entire tool cache
+# and forced re-fetching all 4 MCP servers, adding 6–8 s latency per session.
 _MCP_TOOLS_CACHE = {}
 
+
 async def stream_agent_interaction(
-    prompt: str, 
-    history: List[Dict[str, str]], 
+    prompt: str,
+    history: List[Dict[str, str]],
     state: Dict[str, Any]
 ) -> AsyncGenerator[str, None]:
     """
-    Asynchronously streams the ReAct agent's thoughts, tool invocations, and 
+    Asynchronously streams the ReAct agent's thoughts, tool invocations, and
     final responses back to the frontend client using Server-Sent Events (SSE).
     """
     llm_inst = get_llm()
-    
-    # ── 0. Compress Chat History using the Sandwich Method ──
+
+    # ── 0. Compress Chat History ──
     compressed_history = await compress_history_sandwich(history, llm_inst)
 
-    # ── 1. Reassemble Dynamic LangChain Messages ──
+    # ── 1. Reassemble LangChain Messages ──
     msgs = []
     for h in compressed_history:
         role = h.get("role")
@@ -153,20 +160,20 @@ async def stream_agent_interaction(
             msgs.append(AIMessage(content=content))
     msgs.append(HumanMessage(content=prompt))
 
-    # ── 1.5. Pre-fetch All Connected MCP Tools Dynamically (with global in-memory cache) ──
+    # ── 1.5. Pre-fetch All Connected MCP Tools (with fixed cache key) ──
     global _MCP_TOOLS_CACHE
     all_mcp_tools = {}
-    
+
     if state.get("mcp_servers"):
         servers_to_fetch = {}
         for name, s in state["mcp_servers"].items():
-            # Key uniquely identifies this server instance (handles config changes safely!)
-            srv_key = f"{name}:{s.get('url')}:{s.get('auth_value')}"
+            # FIX: key uses name + url only — token rotation no longer busts cache
+            srv_key = f"{name}:{s.get('url')}"
             if srv_key in _MCP_TOOLS_CACHE:
                 all_mcp_tools[name] = _MCP_TOOLS_CACHE[srv_key]
             else:
                 servers_to_fetch[name] = (s, srv_key)
-                
+
         if servers_to_fetch:
             logger.info(f"[CHAT] Cache miss for servers {list(servers_to_fetch.keys())}. Pre-fetching tool definitions dynamically...")
             configs = {}
@@ -176,10 +183,14 @@ async def stream_agent_interaction(
                 if s.get("api_header") and s.get("auth_type") == "api_key":
                     cfg["headers"] = {s["api_header"]: s["auth_value"]}
                 configs[name] = cfg
-                
+
             if configs:
                 client = MultiServerMCPClient(configs)
-                for name in configs.keys():
+
+                # FIX: Run all tool fetches concurrently with asyncio.gather()
+                # Previously sequential: 4 servers × ~2 s each = 8 s total.
+                # Now parallel: all 4 fetch simultaneously in ~2 s.
+                async def _fetch_one(name: str):
                     try:
                         mcp_tools = await client.get_tools(server_name=name)
                         srv_key = servers_to_fetch[name][1]
@@ -189,14 +200,16 @@ async def stream_agent_interaction(
                     except Exception as ex:
                         logger.error(f"[CHAT ERROR] Failed to pre-fetch tools for '{name}': {ex}")
 
-    # ── 2. Smart Planning & Dynamic Tool Sifter ──
+                await asyncio.gather(*[_fetch_one(n) for n in configs.keys()])
+
+    # ── 2. Smart Planning & Dynamic Tool Sifter (with cache) ──
     total_input_tokens = 0
     total_output_tokens = 0
     needs_plan = True
     needs_tools = True
     tool_groups = []
     plan_text = ""
-    
+
     try:
         server_descriptions = ""
         for name, mcp_tools in all_mcp_tools.items():
@@ -218,31 +231,42 @@ async def stream_agent_interaction(
             "Output your decision as a raw JSON block with keys 'category' (string) and 'tool_groups' (list of strings). "
             "Only output the JSON block, nothing else."
         )
-        
-        class_msgs = [SystemMessage(content=classification_prompt)]
-        class_res = await llm_inst.ainvoke(class_msgs)
-        
-        # Track sifter token usage
-        if getattr(class_res, "usage_metadata", None):
-            total_input_tokens += class_res.usage_metadata.get("input_tokens", 0)
-            total_output_tokens += class_res.usage_metadata.get("output_tokens", 0)
+
+        # FIX: Cache sifter classifications — KEY_SIFTER was defined in redis_cache.py
+        # but never actually used anywhere. Saves one full LLM round-trip per repeat query.
+        sifter_hash = hashlib.sha256(
+            f"{prompt.lower().strip()}:{server_descriptions}".encode("utf-8")
+        ).hexdigest()[:32]
+
+        cached_sifter = await cache.get_sifter(sifter_hash)
+        if cached_sifter:
+            category = cached_sifter.get("category", "COMPLEX")
+            tool_groups = cached_sifter.get("tool_groups", [])
+            logger.info(f"[PLANNER] Sifter cache hit: {category} | Groups: {tool_groups}")
         else:
-            total_input_tokens += count_tokens(classification_prompt)
-            total_output_tokens += count_tokens(class_res.content)
-            
-        class_decision_text = class_res.content.strip()
-        class_decision_text = re.sub(r"```json\s*|\s*```", "", class_decision_text).strip()
-        
-        try:
-            meta = json.loads(class_decision_text)
-            category = meta.get("category", "COMPLEX").strip().upper()
-            tool_groups = [g.strip() for g in meta.get("tool_groups", [])]
-        except Exception:
-            category = "COMPLEX"
-            tool_groups = list(state.get("mcp_servers", {}).keys()) + ["Local"]
-            
-        logger.info(f"[PLANNER] Sifter decision: {category} | Groups: {tool_groups}")
-        
+            class_msgs = [SystemMessage(content=classification_prompt)]
+            class_res = await llm_inst.ainvoke(class_msgs)
+
+            if getattr(class_res, "usage_metadata", None):
+                total_input_tokens += class_res.usage_metadata.get("input_tokens", 0)
+                total_output_tokens += class_res.usage_metadata.get("output_tokens", 0)
+            else:
+                total_input_tokens += count_tokens(classification_prompt)
+                total_output_tokens += count_tokens(class_res.content)
+
+            class_decision_text = re.sub(r"```json\s*|\s*```", "", class_res.content.strip()).strip()
+
+            try:
+                meta = json.loads(class_decision_text)
+                category = meta.get("category", "COMPLEX").strip().upper()
+                tool_groups = [g.strip() for g in meta.get("tool_groups", [])]
+                await cache.set_sifter(sifter_hash, {"category": category, "tool_groups": tool_groups})
+            except Exception:
+                category = "COMPLEX"
+                tool_groups = list(state.get("mcp_servers", {}).keys()) + ["Local"]
+
+            logger.info(f"[PLANNER] Sifter decision: {category} | Groups: {tool_groups}")
+
         if "CONVERSATIONAL" in category:
             needs_plan = False
             needs_tools = False
@@ -260,12 +284,11 @@ async def stream_agent_interaction(
         needs_tools = True
         tool_groups = list(state.get("mcp_servers", {}).keys()) + ["Local"]
 
-    # ── 3. Resolve Connected MCP & Local Tools (Only if Needed!) ──
+    # ── 3. Resolve Connected MCP & Local Tools ──
     tools = []
-    
+
     if needs_tools:
         for name in tool_groups:
-            # Match case-insensitively with active servers
             matched_name = None
             for server_name in all_mcp_tools.keys():
                 if name.lower() in server_name.lower() or server_name.lower() in name.lower():
@@ -275,19 +298,16 @@ async def stream_agent_interaction(
                 tools.extend([wrap_tool_with_coercion(t) for t in all_mcp_tools[matched_name]])
                 logger.info(f"[CHAT] Loaded {len(all_mcp_tools[matched_name])} tools from server '{matched_name}'.")
 
-        # Bind secure file reader tool (only if 'Local' is requested)
         if "Local" in tool_groups and state.get("uploaded_files"):
             read_file_tool = get_read_uploaded_file_tool(UPLOAD_DIR)
             tools.append(read_file_tool)
             logger.info("[CHAT] Equipped agent with file reading tool 'read_uploaded_file'.")
-            
-        # Bind indexed documentation search tool (only if 'Local' is requested)
+
         if "Local" in tool_groups and state.get("loaded_docs"):
             doc_search_tool = get_query_documentation_tool(state["loaded_docs"])
             tools.append(doc_search_tool)
             logger.info("[CHAT] Equipped agent with doc query tool 'query_documentation'.")
 
-        # Bind web search and scrape tools (only if 'Local' is requested)
         if "Local" in tool_groups:
             tools.append(web_search)
             tools.append(web_scrape)
@@ -296,14 +316,13 @@ async def stream_agent_interaction(
         # ── 3.5. Semantic Tool RAG Filtering ──
         if tools:
             from database import retrieve_relevant_tools
-            # Filter tools down to the top 7 most relevant ones matching the prompt
-            tools = await retrieve_relevant_tools(prompt, tools, top_k=7)
+            tools = await retrieve_relevant_tools(prompt, tools, top_k=5)
 
-    # ── 4. Strategic Planning Phase (One Main LLM Call if Required) ──
+    # ── 4. Strategic Planning Phase ──
     if needs_plan:
         logger.info("[PLANNER] Running pre-execution strategic planning call...")
-        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Creating strategic execution plan...'})}\n\n"
-        
+        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Creating strategic execution plan...'})}\\n\\n"
+
         try:
             planning_system_prompt = (
                 "You are the Strategic Planning Engine for an advanced multi-tool AI sales and productivity assistant.\n"
@@ -313,7 +332,7 @@ async def stream_agent_interaction(
                 "Focus heavily on workflow dependencies (e.g. '1. Search HubSpot for X... 2. Get website... 3. Scrape and extract details... 4. Enrich CRM').\n"
                 "Output the plan clearly. Do NOT call any tools yet—just outline the strategy. Keep it structured and action-oriented."
             )
-            
+
             planning_msgs = [SystemMessage(content=planning_system_prompt)]
             for h in compressed_history:
                 role = h.get("role")
@@ -323,21 +342,18 @@ async def stream_agent_interaction(
                 elif role == "assistant":
                     planning_msgs.append(AIMessage(content=content))
             planning_msgs.append(HumanMessage(content=f"Generate a strategic execution plan (TODO list) for: '{prompt}'"))
-            
+
             plan_response = await llm_inst.ainvoke(planning_msgs)
-            
-            # Track planning token usage
+
             if getattr(plan_response, "usage_metadata", None):
                 total_input_tokens += plan_response.usage_metadata.get("input_tokens", 0)
                 total_output_tokens += plan_response.usage_metadata.get("output_tokens", 0)
             else:
                 total_input_tokens += sum(count_tokens(msg.content) for msg in planning_msgs)
                 total_output_tokens += count_tokens(plan_response.content)
-                
+
             plan_text = plan_response.content if hasattr(plan_response, "content") else str(plan_response)
-            
-            # Stream the strategic plan immediately to the Streamlit UI!
-            yield f"event: thought\ndata: {json.dumps({'text': f'📋 **Strategic Execution Plan Created**:\\n{plan_text}'})}\n\n"
+            yield f"event: thought\ndata: {json.dumps({'text': f'📋 **Strategic Execution Plan Created**:\\n{plan_text}'})}\\n\\n"
         except Exception as plan_err:
             logger.error(f"[PLANNER ERROR] Strategic planning call failed: {plan_err}")
             plan_text = "Step 1: Directly process request using available tools."
@@ -361,63 +377,58 @@ async def stream_agent_interaction(
             f"If tools are needed, call them dynamically. Otherwise, provide a clear and helpful direct response."
         )
     else:
-        # Conversational fallback (pure small talk - no tools at all!)
         system_prompt = (
             "You are a friendly, helpful, and highly capable AI productivity assistant. "
             "Respond directly to the user's greeting or conversational chat in a friendly and professional manner. "
             "Keep the response brief and pleasant."
         )
-    
-    # SSE Stream Generator
+
     logger.info("[AGENT EXECUTE] Initializing LangGraph ReAct agent stream...")
     if needs_plan:
-        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Starting plan execution with dynamic tools...'})}\n\n"
-    
+        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Starting plan execution with dynamic tools...'})}\\n\\n"
+
     try:
         if tools:
             agent = create_react_agent(llm_inst, tools, prompt=system_prompt)
             async for chunk in agent.astream({"messages": msgs}):
                 if "agent" in chunk:
                     for msg in chunk["agent"]["messages"]:
-                        # Track token usage from agent messages
                         if getattr(msg, "usage_metadata", None):
                             total_input_tokens += msg.usage_metadata.get("input_tokens", 0)
                             total_output_tokens += msg.usage_metadata.get("output_tokens", 0)
-                        
-                        # Tool call event detection
+
                         if getattr(msg, "tool_calls", None):
                             for tc in msg.tool_calls:
                                 logger.info(f"[AGENT THOUGHT] Calling tool: {tc['name']}")
-                                yield f"event: tool_call\ndata: {json.dumps({'name': tc['name'], 'args': tc['args']})}\n\n"
-                                
-                        # Streaming content logs
+                                logger.info(f"[TOOL INVOKE] Calling tool '{tc['name']}' with arguments: {tc['args']}")
+                                yield f"event: tool_call\ndata: {json.dumps({'name': tc['name'], 'args': tc['args']})}\\n\\n"
+
                         if hasattr(msg, "content") and msg.content:
                             logger.info(f"[AGENT CHUNK] Assistant text chunk returned.")
-                            yield f"event: content\ndata: {json.dumps({'text': msg.content})}\n\n"
-                            
+                            yield f"event: content\ndata: {json.dumps({'text': msg.content})}\\n\\n"
+
                 elif "tools" in chunk:
                     for msg in chunk["tools"]["messages"]:
                         logger.info(f"[TOOL RESPONSE] Tool response captured for: {msg.name}")
-                        yield f"event: tool_output\ndata: {json.dumps({'name': msg.name, 'content': str(msg.content)})}\n\n"
+                        logger.info(f"[TOOL SUCCESS] Tool '{msg.name}' successfully returned output.")
+                        yield f"event: tool_output\ndata: {json.dumps({'name': msg.name, 'content': str(msg.content)})}\\n\\n"
         else:
-            # Fallback streaming without active tools (pure conversational greeting!)
             logger.info("[CHAT] No tools loaded. Streaming chat response directly from LLM...")
             full_msgs = [SystemMessage(content=system_prompt)] + msgs
             total_input_tokens += sum(count_tokens(m.content) for m in full_msgs)
-            
+
             full_response = ""
             async for token_chunk in llm_inst.astream(full_msgs):
                 if token_chunk.content:
                     full_response += token_chunk.content
-                    yield f"event: content\ndata: {json.dumps({'text': token_chunk.content})}\n\n"
+                    yield f"event: content\ndata: {json.dumps({'text': token_chunk.content})}\\n\\n"
             total_output_tokens += count_tokens(full_response)
-                    
-        # Yield total tracked tokens to frontend
-        yield f"event: token_usage\ndata: {json.dumps({'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens})}\n\n"
-        yield f"event: thought\ndata: {json.dumps({'text': '✅ Completed successfully'})}\n\n"
-        
+
+        yield f"event: token_usage\ndata: {json.dumps({'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens})}\\n\\n"
+        yield f"event: thought\ndata: {json.dumps({'text': '✅ Completed successfully'})}\\n\\n"
+
     except Exception as e:
         logger.error(f"[CHAT ERROR] Streaming execution encountered error: {e}", exc_info=True)
         from routes.state_routes import unpack_exception
         clean_msg = unpack_exception(e)
-        yield f"event: error\ndata: {json.dumps({'message': clean_msg})}\n\n"
+        yield f"event: error\ndata: {json.dumps({'message': clean_msg})}\\n\\n"

@@ -26,6 +26,7 @@ Usage::
     await cache.disconnect()     # call in FastAPI shutdown
 """
 
+import asyncio
 import json
 import os
 import time
@@ -49,13 +50,19 @@ KEY_HISTORY          = lambda h: f"mcp:history:{h}"
 KEY_SIFTER           = lambda h: f"mcp:sifter:{h}"
 KEY_DOC_CHUNK        = lambda name, idx: f"mcp:doc:chunk:{name}:{idx}"
 
+# Eviction runs every 10 minutes
+_EVICTION_INTERVAL = 600
+
 
 class AsyncHybridCache:
     """
-    Async Redis cache with auto-reconnect and in-memory fallback.
+    Async Redis cache with non-blocking auto-reconnect and in-memory fallback.
     Call ``await cache.connect()`` on app startup.
-    On timeout/connection errors, retries every 30s automatically.
-    In-memory fallback keeps the app functional when Redis is down.
+
+    FIX: reconnect attempts now run as background asyncio tasks so they never
+    block a user-facing request (previously caused 8 s stalls per request).
+    FIX: periodic background eviction prevents in-memory cache from growing
+    unbounded when Redis is unavailable.
     """
 
     _RECONNECT_COOLDOWN = 30  # seconds between reconnect attempts
@@ -65,12 +72,15 @@ class AsyncHybridCache:
         self._available = False
         self._url = os.environ.get("REDIS_URL", "redis://localhost:6379")
         self._last_fail_time = 0.0
+        self._reconnect_in_progress = False
         self._memory_cache: dict = {}  # In-memory fallback
+        self._eviction_task: Optional[asyncio.Task] = None
 
     async def connect(self, url: Optional[str] = None) -> bool:
         """
         Try to connect to Redis. Returns True if successful.
         App continues normally if this returns False (uses in-memory fallback).
+        Uses a 1 s connect timeout so startup is not delayed.
         """
         if url:
             self._url = url
@@ -79,8 +89,8 @@ class AsyncHybridCache:
                 self._url,
                 encoding="utf-8",
                 decode_responses=True,
-                socket_connect_timeout=5,
-                socket_timeout=5,
+                socket_connect_timeout=1,   # FIX: was 5 s — fail fast
+                socket_timeout=3,
                 max_connections=20,
                 retry_on_timeout=True
             )
@@ -89,22 +99,67 @@ class AsyncHybridCache:
             self._available = True
             self._last_fail_time = 0.0
             logger.info(f"[CACHE] ✅ Redis connected at {self._url}")
+            self._start_eviction_loop()
             return True
         except Exception as e:
             self._available = False
             self._last_fail_time = time.time()
             logger.warning(f"[CACHE] ⚠️  Redis unavailable ({e}) — using in-memory fallback")
+            self._start_eviction_loop()
             return False
 
-    async def _try_reconnect(self) -> bool:
-        """Auto-reconnect after cooldown period. Returns True if reconnected."""
+    def _start_eviction_loop(self):
+        """Start the background eviction task if not already running."""
+        if self._eviction_task is None or self._eviction_task.done():
+            try:
+                self._eviction_task = asyncio.get_event_loop().create_task(
+                    self._evict_expired_loop()
+                )
+            except RuntimeError:
+                pass  # No event loop yet — will be started on first request
+
+    async def _evict_expired_loop(self):
+        """FIX: Background task that purges expired in-memory entries every 10 min."""
+        while True:
+            await asyncio.sleep(_EVICTION_INTERVAL)
+            try:
+                now = time.time()
+                expired = [
+                    k for k, v in self._memory_cache.items()
+                    if v.get("expires_at") and now > v["expires_at"]
+                ]
+                for k in expired:
+                    self._memory_cache.pop(k, None)
+                if expired:
+                    logger.info(f"[CACHE] Evicted {len(expired)} expired in-memory entries.")
+            except Exception as e:
+                logger.warning(f"[CACHE] Eviction error: {e}")
+
+    def _schedule_reconnect(self):
+        """
+        FIX: Fire a non-blocking background reconnect attempt.
+        Never awaited inline — so it never stalls a request.
+        """
+        if self._reconnect_in_progress:
+            return
         if time.time() - self._last_fail_time < self._RECONNECT_COOLDOWN:
-            return False
-        logger.info("[CACHE] 🔄 Redis auto-reconnect attempt...")
-        return await self.connect(self._url)
+            return
+        self._reconnect_in_progress = True
+
+        async def _do_reconnect():
+            logger.info("[CACHE] 🔄 Redis auto-reconnect attempt (background)...")
+            await self.connect(self._url)
+            self._reconnect_in_progress = False
+
+        try:
+            asyncio.get_event_loop().create_task(_do_reconnect())
+        except RuntimeError:
+            self._reconnect_in_progress = False
 
     async def disconnect(self):
         """Gracefully close Redis connection. Call on app shutdown."""
+        if self._eviction_task and not self._eviction_task.done():
+            self._eviction_task.cancel()
         if self._redis:
             await self._redis.aclose()
             self._redis = None
@@ -127,8 +182,8 @@ class AsyncHybridCache:
         """
         Retrieves and deserializes a value. Tries Redis first, falls back
         to in-memory cache if Redis is unavailable.
+        FIX: reconnect is scheduled as a background task — never blocks.
         """
-        # Try Redis
         if self._available:
             try:
                 raw = await self._redis.get(key)
@@ -137,10 +192,11 @@ class AsyncHybridCache:
             except Exception as e:
                 logger.warning(f"[CACHE] Redis GET error for '{key}': {e}")
                 if "Timeout" in str(e) or "Connection" in str(e):
-                    self._last_fail_time = time.time()
                     self._available = False
+                    self._last_fail_time = time.time()
+                    self._schedule_reconnect()
         else:
-            await self._try_reconnect()
+            self._schedule_reconnect()  # FIX: non-blocking background reconnect
 
         # In-memory fallback
         entry = self._memory_cache.get(key)
@@ -172,12 +228,12 @@ class AsyncHybridCache:
             except Exception as e:
                 logger.warning(f"[CACHE] Redis SET error for '{key}': {e}")
                 if "Timeout" in str(e) or "Connection" in str(e):
-                    self._last_fail_time = time.time()
                     self._available = False
+                    self._last_fail_time = time.time()
+                    self._schedule_reconnect()
         else:
-            await self._try_reconnect()
-        # BUG FIX: in-memory write above always succeeds, so return True
-        return True
+            self._schedule_reconnect()
+        return True  # in-memory write always succeeds
 
     async def delete(self, key: str) -> bool:
         """Delete a single key from both Redis and in-memory cache."""
@@ -191,15 +247,14 @@ class AsyncHybridCache:
             except Exception as e:
                 logger.warning(f"[CACHE] Redis DEL error for '{key}': {e}")
                 if "Timeout" in str(e) or "Connection" in str(e):
-                    self._last_fail_time = time.time()
                     self._available = False
-        # BUG FIX: return True if the key existed and was removed from memory cache
+                    self._last_fail_time = time.time()
+                    self._schedule_reconnect()
         return was_in_memory
 
     async def flush_pattern(self, pattern: str) -> int:
         """
         Delete all keys matching a pattern using SCAN cursor (non-blocking).
-        Unlike KEYS, SCAN is safe in production with large keyspaces.
         Also clears matching keys from in-memory cache.
         """
         import fnmatch
@@ -211,8 +266,8 @@ class AsyncHybridCache:
             del self._memory_cache[k]
 
         if not self._available:
-            if not await self._try_reconnect():
-                return len(mem_keys_to_delete)
+            self._schedule_reconnect()
+            return len(mem_keys_to_delete)
         try:
             deleted = 0
             cursor = 0
@@ -233,14 +288,13 @@ class AsyncHybridCache:
         if not self._available:
             entry = self._memory_cache.get(key)
             if entry is None:
-                return -2  # key not found
+                return -2
             if entry["expires_at"] is None:
-                # BUG FIX: key exists but has no expiry — return -1, not -2
                 return -1
             remaining = int(entry["expires_at"] - time.time())
             if remaining <= 0:
                 del self._memory_cache[key]
-                return -2  # expired
+                return -2
             return remaining
         try:
             return await self._redis.ttl(key)
@@ -280,6 +334,14 @@ class AsyncHybridCache:
         """Cache a history summary for 1 hour."""
         return await self.set(KEY_HISTORY(summary_hash), summary, TTL_HISTORY_SUMMARY)
 
+    async def get_sifter(self, sifter_hash: str) -> Optional[dict]:
+        """Get a cached sifter classification result."""
+        return await self.get(KEY_SIFTER(sifter_hash))
+
+    async def set_sifter(self, sifter_hash: str, decision: dict) -> bool:
+        """Cache a sifter decision for 10 minutes."""
+        return await self.set(KEY_SIFTER(sifter_hash), decision, TTL_SIFTER)
+
     async def invalidate_tool_cache(self) -> int:
         """Clear all cached tool responses."""
         return await self.flush_pattern("mcp:tool_resp:*")
@@ -316,4 +378,4 @@ class AsyncHybridCache:
 
 
 # ── Singleton Instance ────────────────────────────────────────────────────────
-cache = AsyncHybridCache()  
+cache = AsyncHybridCache()

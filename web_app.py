@@ -119,8 +119,24 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "web_app:app",
-        host="127.0.0.1",
-        port=8000,
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "8000")),
         reload=True,
-        reload_excludes=["*.log", "mcp_state.json", "oauth_flows.json", "uploaded_files/*", "uploaded_files"]
+        # FIX: The previous list only excluded "*.log" (root directory only) and missed
+        # .logs/app.log (written every ~400 ms), scratch/, and __pycache__/ dirs.
+        # Every write to app.log triggered a full server restart and killed active SSE
+        # streams. Patterns now use ** globs to cover all subdirectories.
+        reload_excludes=[
+            "**/*.log",
+            ".logs",
+            ".logs/*",
+            "mcp_state.json",
+            "oauth_flows.json",
+            "uploaded_files",
+            "uploaded_files/*",
+            "scratch",
+            "scratch/*",
+            "**/__pycache__/*",
+            "**/*.pyc",
+        ]
     )

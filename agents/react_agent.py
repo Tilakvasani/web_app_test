@@ -185,14 +185,13 @@ async def stream_agent_interaction(
                 configs[name] = cfg
 
             if configs:
-                client = MultiServerMCPClient(configs)
-
-                # FIX: Run all tool fetches concurrently with asyncio.gather()
-                # Previously sequential: 4 servers × ~2 s each = 8 s total.
-                # Now parallel: all 4 fetch simultaneously in ~2 s.
+                # langchain-mcp-adapters 0.1.0 API:
+                # client = MultiServerMCPClient(...)
+                # tools = await client.get_tools()   ← no async with, no server_name arg
                 async def _fetch_one(name: str):
                     try:
-                        mcp_tools = await client.get_tools(server_name=name)
+                        single_client = MultiServerMCPClient({name: configs[name]})
+                        mcp_tools = await single_client.get_tools()
                         srv_key = servers_to_fetch[name][1]
                         _MCP_TOOLS_CACHE[srv_key] = mcp_tools
                         all_mcp_tools[name] = mcp_tools

@@ -57,13 +57,18 @@ async def call_mcp_tool_directly(server_name: str, tool_name: str, tool_args: di
     cfg = _make_cfg(s["url"], s["auth_type"], s["auth_value"], transport=transport)
     if s.get("api_header") and s.get("auth_type") == "api_key":
         cfg["headers"] = {s["api_header"]: s["auth_value"]}
-        
-    client = MultiServerMCPClient({server_name: cfg})
+
+    # langchain-mcp-adapters 0.1.0 API: no async with, just client.get_tools()
     try:
-        # Retrieve tools first to verify transport link
-        await client.get_tools(server_name=server_name)
-        # Call tool dynamically
-        res = await client.ainvoke(tool_name, tool_args)
+        client = MultiServerMCPClient({server_name: cfg})
+        tools = await client.get_tools()
+        tool = next((t for t in tools if t.name == tool_name), None)
+        if tool is None:
+            raise ValueError(
+                f"Tool '{tool_name}' not found on server '{server_name}'. "
+                f"Available tools: {[t.name for t in tools]}"
+            )
+        res = await tool.ainvoke(tool_args)
         return res
     except Exception as e:
         logger.error(f"Direct MCP tool call failed: {e}")
@@ -88,28 +93,38 @@ async def chat_interaction(body: ChatRequest):
     try:
         prompt_lower = body.prompt.lower().strip()
 
-        # FIX: Trimmed conversational_words to genuine back-reference pronouns only.
-        # "it", "this", "there", "here", "then" were causing valid standalone queries
-        # (e.g. "list all companies in HubSpot") to bypass the prompt-only cache.
+        # Words that indicate the message refers to previous context —
+        # these need history included in the cache key.
         conversational_words = {
             "why", "more", "explain", "he", "she", "him",
             "her", "they", "them", "that", "prev", "first", "second",
             "last", "those", "these"
         }
 
+        # Pure greeting/small-talk patterns — response never depends on history,
+        # so always safe to use a prompt-only key.
+        greeting_patterns = re.compile(
+            r"^(hi+|hello+|hey+|howdy|greetings|good\s*(morning|afternoon|evening|day)"
+            r"|what'?s\s*up|sup|yo|hiya|how\s+are\s+you|how\s+r\s+u)[\s!?.]*$"
+        )
+
         words = set(re.findall(r"\b\w+\b", prompt_lower))
         is_conversational_followup = bool(words.intersection(conversational_words))
+        is_pure_greeting = bool(greeting_patterns.match(prompt_lower))
 
-        if len(prompt_lower) > 8 and not is_conversational_followup:
-            # FIX: Use SHA-256 instead of MD5 — MD5 has known collision vulnerabilities
-            # and cache keys can be user-controlled input (prompt text).
+        # Use prompt-only key when:
+        #   • prompt is longer than 8 chars with no back-reference words, OR
+        #   • prompt is a pure greeting (hi/hello/hey etc.) — these always get
+        #     the same response regardless of history, so the old context-aware
+        #     key was generating a new hash every request and never hitting cache.
+        if is_pure_greeting or (len(prompt_lower) > 8 and not is_conversational_followup):
             req_hash = hashlib.sha256(f"prompt_only:{prompt_lower}".encode("utf-8")).hexdigest()[:32]
             logger.info(f"[CHAT CACHE] Using prompt-only caching key for query '{prompt_lower}'")
         else:
             history_str = json.dumps(body.history, sort_keys=True)
             req_hash = hashlib.sha256(f"{prompt_lower}:{history_str}".encode("utf-8")).hexdigest()[:32]
             logger.info(f"[CHAT CACHE] Using context-aware caching key for query '{prompt_lower}'")
-            
+
         cache_key = f"chat_resp:{req_hash}"
     except Exception as hash_err:
         logger.error(f"[CHAT CACHE ERROR] Failed to compute request hash: {hash_err}")
@@ -506,7 +521,7 @@ async def execute_command(body: CommandRequest):
                     "Extract Cal.com meeting booking details from this natural language text:\n"
                     f"\"{text_details}\"\n"
                     "Output a clean JSON with keys 'title', 'start_time' (ISO format), and 'duration_minutes' (int). "
-                    "Use future timestamps relative to 2026-05-26. Output ONLY raw JSON."
+                    f"Use future timestamps relative to {__import__('datetime').date.today().isoformat()}. Output ONLY raw JSON."
                 )
                 parse_res = await llm.ainvoke([HumanMessage(content=parse_prompt)])
                 parse_text = re.sub(r'```json\s*|\s*```', '', parse_res.content).strip()

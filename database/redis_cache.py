@@ -139,12 +139,19 @@ class AsyncHybridCache:
         """
         FIX: Fire a non-blocking background reconnect attempt.
         Never awaited inline — so it never stalls a request.
+
+        FIX: _last_fail_time is now stamped BEFORE the background task is
+        dispatched. Previously it was only updated inside connect() AFTER the
+        attempt completed, so multiple concurrent requests could all pass the
+        cooldown check simultaneously and queue up duplicate reconnect tasks.
+        Stamping it here closes the window immediately.
         """
         if self._reconnect_in_progress:
             return
         if time.time() - self._last_fail_time < self._RECONNECT_COOLDOWN:
             return
         self._reconnect_in_progress = True
+        self._last_fail_time = time.time()  # FIX: lock the cooldown window immediately
 
         async def _do_reconnect():
             logger.info("[CACHE] 🔄 Redis auto-reconnect attempt (background)...")

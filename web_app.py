@@ -17,14 +17,39 @@ from database import cache
 import os
 os.makedirs(".logs", exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(os.path.join(".logs", "app.log"), encoding="utf-8"),
-        logging.StreamHandler(),
-    ]
-)
+class EmojiFormatter(logging.Formatter):
+    LEVEL_EMOJIS = {
+        "DEBUG": "🔍 DEBUG",
+        "INFO": "✨ INFO",
+        "WARNING": "⚠️ WARN",
+        "ERROR": "❌ ERROR",
+        "CRITICAL": "🚨 CRIT",
+    }
+
+    def format(self, record):
+        time_str = self.formatTime(record, "%H:%M:%S")
+        emoji_level = self.LEVEL_EMOJIS.get(record.levelname, record.levelname)
+        prefix = f"{time_str} [{emoji_level}]"
+        if record.name and record.name != "root":
+            prefix += f" [{record.name}]"
+        return f"{prefix} {record.getMessage()}"
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Clear existing handlers to prevent duplicate output if reloaded
+for h in list(root_logger.handlers):
+    root_logger.removeHandler(h)
+
+file_handler = logging.FileHandler(os.path.join(".logs", "app.log"), encoding="utf-8")
+stream_handler = logging.StreamHandler()
+
+formatter = EmojiFormatter()
+file_handler.setFormatter(formatter)
+stream_handler.setFormatter(formatter)
+
+root_logger.addHandler(file_handler)
+root_logger.addHandler(stream_handler)
 
 logger = logging.getLogger("mcp_backend")
 logger.info("Initializing Modular FastAPI Server...")

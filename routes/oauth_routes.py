@@ -713,7 +713,16 @@ async def proactively_refresh_server_tokens():
     for name, s in list(state.get("mcp_servers", {}).items()):
         if s.get("auth_type") == "bearer" and "expires_at" in s and "refresh_token" in s:
             time_left = s["expires_at"] - now
-            if time_left < 300: # 5 min limit
+
+            # FIX: Force-refresh Google tokens on first startup after the scope fix.
+            # Old tokens were issued without full Drive scopes — a forced refresh
+            # gets a new token with drive + drive.file + drive.readonly included.
+            # _scope_refreshed flag prevents redundant refreshes on subsequent startups.
+            server_url = s.get("url", "")
+            is_google = any(d in server_url.lower() for d in GOOGLE_OAUTH_SPECS.keys())
+            force_refresh = is_google and not s.get("_scope_refreshed", False)
+
+            if force_refresh or time_left < 300: # 5 min limit
                 logger.info(f"[PROACTIVE REFRESH] Refreshing token for '{name}'...")
                 try:
                     endpoints = s["oauth_endpoints"]
@@ -726,6 +735,14 @@ async def proactively_refresh_server_tokens():
                     }
                     if client_credentials.get("client_secret"):
                         params["client_secret"] = client_credentials["client_secret"]
+
+                    # FIX: Google requires scope in refresh requests for drivemcp.
+                    # Without it, the new access token is issued with reduced/no Drive
+                    # permissions and every tool call returns 403 Forbidden.
+                    for domain_key, spec in GOOGLE_OAUTH_SPECS.items():
+                        if domain_key in server_url.lower():
+                            params["scope"] = spec.get("scope", "")
+                            break
                         
                     async with httpx.AsyncClient() as client:
                         resp = await client.post(
@@ -741,6 +758,7 @@ async def proactively_refresh_server_tokens():
                                 s["refresh_token"] = tokens["refresh_token"]
                             expires_in = tokens.get("expires_in", 3600)
                             s["expires_at"] = time.time() + expires_in
+                            s["_scope_refreshed"] = True  # don't force-refresh again next startup
                             modified = True
                             logger.info(f"[PROACTIVE REFRESH SUCCESS] Refreshed token for '{name}'.")
                         else:
@@ -749,4 +767,3 @@ async def proactively_refresh_server_tokens():
                     logger.error(f"[PROACTIVE REFRESH ERROR] Exception for '{name}': {e}")
     if modified:
         save_state(state)
-

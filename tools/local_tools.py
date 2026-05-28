@@ -122,47 +122,77 @@ def wrap_tool_with_coercion(tool_inst: BaseTool) -> BaseTool:
         response_format="content",
     )
 
+# MIME type map used by both tools below
+_MIME_TYPES = {
+    ".pdf":  "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc":  "application/msword",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls":  "application/vnd.ms-excel",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif":  "image/gif",
+    ".txt":  "text/plain",
+    ".md":   "text/markdown",
+    ".csv":  "text/csv",
+    ".json": "application/json",
+    ".html": "text/html",
+    ".xml":  "application/xml",
+    ".zip":  "application/zip",
+}
+
+# File extensions that are plain text and can be read directly
+_TEXT_EXTENSIONS = {".txt", ".md", ".json", ".csv", ".py", ".html", ".css", ".js", ".xml", ".yaml", ".yml"}
+
+# File extensions that must be sent as binary (base64) to Google Drive / Gmail
+_BINARY_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".png", ".jpg", ".jpeg", ".gif", ".zip"}
+
+
 def get_read_uploaded_file_tool(upload_dir: str):
     """
     Creates and returns the `read_uploaded_file` tool bound to the specified upload directory.
+    Use this to READ/ANALYSE file contents. For uploading files to Google Drive use
+    `prepare_file_for_upload` instead.
     """
     @tool
     def read_uploaded_file(filename: str) -> str:
         """
-        Read the contents of a local file uploaded by the user to the server.
-        Use this tool when you need to read the content of a file (like a resume, CV,
-        or data spreadsheet) to analyze it, answer questions about it, or upload
-        its content to a connected service (like Google Drive, Gmail, or Notion).
+        Read and extract the TEXT contents of a local file uploaded by the user.
+        Use this tool to READ, ANALYSE, or SUMMARISE a file's content.
+        For uploading a file to Google Drive or Gmail use the
+        `prepare_file_for_upload` tool instead — it returns the correct
+        base64-encoded binary content and MIME type that Google requires.
         """
         safe_filename = os.path.basename(filename)
         file_path = os.path.join(upload_dir, safe_filename)
-        
+
         if not os.path.exists(file_path):
             return f"Error: File '{filename}' not found in the secure upload directory."
-            
+
         logger.info(f"[FILE READ] Agent is reading file '{safe_filename}'...")
+        ext = os.path.splitext(safe_filename)[1].lower()
+
         try:
-            # Parse text file formats
-            if any(safe_filename.lower().endswith(ext) for ext in [".txt", ".md", ".json", ".csv", ".py", ".html", ".css", ".js", ".xml", ".yaml", ".yml"]):
+            if ext in _TEXT_EXTENSIONS:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     return f.read()
-                    
-            # Parse PDF document files
-            elif safe_filename.lower().endswith(".pdf"):
-                text_content = []
+
+            elif ext == ".pdf":
                 try:
                     import pypdf
                     reader = pypdf.PdfReader(file_path)
+                    pages = []
                     for i, page in enumerate(reader.pages):
-                        page_text = page.extract_text()
-                        if page_text:
-                            text_content.append(f"--- Page {i+1} ---\n{page_text}")
-                    return "\n\n".join(text_content) if text_content else "No text could be extracted from PDF."
+                        text = page.extract_text()
+                        if text:
+                            pages.append(f"--- Page {i+1} ---\n{text}")
+                    return "\n\n".join(pages) if pages else "No text could be extracted from this PDF."
                 except Exception as pdf_err:
-                    return f"Error extracting text from PDF file: {pdf_err}"
-                    
-            # Parse Microsoft Word files
-            elif safe_filename.lower().endswith(".docx"):
+                    return f"Error extracting text from PDF: {pdf_err}"
+
+            elif ext == ".docx":
                 try:
                     import docx
                     doc = docx.Document(file_path)
@@ -170,24 +200,107 @@ def get_read_uploaded_file_tool(upload_dir: str):
                     tables_text = []
                     for table in doc.tables:
                         for row in table.rows:
-                            row_text = [cell.text for cell in row.cells]
-                            tables_text.append(" | ".join(row_text))
+                            tables_text.append(" | ".join(cell.text for cell in row.cells))
                     full_text = "\n".join(paragraphs)
                     if tables_text:
-                        full_text += "\n\n--- Tables in Document ---\n" + "\n".join(tables_text)
+                        full_text += "\n\n--- Tables ---\n" + "\n".join(tables_text)
                     return full_text if full_text.strip() else "No text found in Word document."
                 except Exception as doc_err:
                     return f"Error extracting text from Word document: {doc_err}"
+
             else:
                 try:
                     with open(file_path, "r", encoding="utf-8") as f:
                         return f.read(10000)
                 except UnicodeDecodeError:
-                    return f"Error: File '{safe_filename}' appears to be binary. Supported formats: .txt, .md, .json, .csv, .pdf, .docx"
+                    return (
+                        f"File '{safe_filename}' is a binary file. "
+                        f"Use `prepare_file_for_upload` to get its base64 content for uploading to Google Drive."
+                    )
+
         except Exception as e:
             return f"Error reading file '{filename}': {e}"
-            
+
     return read_uploaded_file
+
+
+def get_prepare_file_for_upload_tool(upload_dir: str):
+    """
+    Creates and returns the `prepare_file_for_upload` tool.
+
+    This is the CORRECT tool to use before uploading any file to Google Drive or Gmail.
+    It returns:
+      - base64-encoded binary content  (for PDFs, DOCX, images, etc.)
+      - OR plain text content          (for .txt, .csv, .md, etc.)
+      - MIME type string               (always included)
+
+    Google Drive's `create_file` tool requires:
+        name        = filename
+        mimeType    = value returned by this tool
+        content     = value returned by this tool  (base64 for binary, text for text)
+    """
+    @tool
+    def prepare_file_for_upload(filename: str) -> str:
+        """
+        Prepare a locally uploaded file for uploading to Google Drive or Gmail.
+        Returns the file's content in the correct format (base64 for binary files
+        like PDF/DOCX/images, plain text for .txt/.csv/.md) and its MIME type.
+
+        ALWAYS call this tool before calling Google Drive's create_file or
+        Gmail's send_email with an attachment. Never pass extracted text from
+        `read_uploaded_file` to Google Drive — that causes 'invalid document' errors
+        because Google Drive expects raw binary content (base64), not extracted text.
+
+        Returns a JSON string with keys: filename, mime_type, content, encoding.
+        Pass `content` as the file content and `mime_type` as the mimeType argument
+        to Google Drive's create_file tool.
+        """
+        import base64
+        import json as _json
+
+        safe_filename = os.path.basename(filename)
+        file_path = os.path.join(upload_dir, safe_filename)
+
+        if not os.path.exists(file_path):
+            return f"Error: File '{filename}' not found in the secure upload directory."
+
+        ext = os.path.splitext(safe_filename)[1].lower()
+        mime_type = _MIME_TYPES.get(ext, "application/octet-stream")
+
+        logger.info(f"[FILE PREP] Preparing '{safe_filename}' (MIME: {mime_type}) for upload...")
+
+        try:
+            if ext in _TEXT_EXTENSIONS:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                encoding = "text"
+            else:
+                # Binary file — base64 encode it so it can be passed as a string
+                # to Google Drive's create_file tool without corruption
+                with open(file_path, "rb") as f:
+                    raw_bytes = f.read()
+                content = base64.b64encode(raw_bytes).decode("utf-8")
+                encoding = "base64"
+
+            result = {
+                "filename": safe_filename,
+                "mime_type": mime_type,
+                "content": content,
+                "encoding": encoding,
+                "size_bytes": os.path.getsize(file_path),
+                "instructions": (
+                    f"Pass 'content' as the file content and 'mime_type' as the mimeType "
+                    f"to Google Drive's create_file tool. The encoding is '{encoding}'."
+                )
+            }
+            logger.info(f"[FILE PREP] Successfully prepared '{safe_filename}' ({encoding}, {os.path.getsize(file_path)} bytes).")
+            return _json.dumps(result)
+
+        except Exception as e:
+            logger.error(f"[FILE PREP ERROR] Failed to prepare '{safe_filename}': {e}")
+            return f"Error preparing file '{filename}' for upload: {e}"
+
+    return prepare_file_for_upload
 
 def get_query_documentation_tool(loaded_docs: Dict[str, Any]):
     """

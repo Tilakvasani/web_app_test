@@ -26,6 +26,7 @@ from prompts import build_system_prompt
 from tools import (
     wrap_tool_with_coercion,
     get_read_uploaded_file_tool,
+    get_prepare_file_for_upload_tool,
     get_query_documentation_tool,
     web_search,
     web_scrape
@@ -185,9 +186,7 @@ async def stream_agent_interaction(
                 configs[name] = cfg
 
             if configs:
-                # langchain-mcp-adapters 0.1.0 API:
-                # client = MultiServerMCPClient(...)
-                # tools = await client.get_tools()   ← no async with, no server_name arg
+                # langchain-mcp-adapters 0.1.0: no async with, just instantiate and call get_tools()
                 async def _fetch_one(name: str):
                     try:
                         single_client = MultiServerMCPClient({name: configs[name]})
@@ -210,6 +209,12 @@ async def stream_agent_interaction(
     plan_text = ""
 
     try:
+        # Build server descriptions for the sifter.
+        # FIX: Previously built only from all_mcp_tools — if pre-fetch failed,
+        # all_mcp_tools was empty so the sifter saw NO servers and always picked
+        # 'Local' only, even for queries like "upload to Google Drive".
+        # Now falls back to state["mcp_servers"] so the sifter always knows
+        # which servers are connected regardless of whether tools loaded.
         server_descriptions = ""
         for name, mcp_tools in all_mcp_tools.items():
             tool_names = [getattr(t, "name", "") for t in mcp_tools]
@@ -217,6 +222,11 @@ async def stream_agent_interaction(
             if len(tool_names) > 6:
                 tools_summary += f", and {len(tool_names) - 6} more"
             server_descriptions += f"- '{name}': Handles operations utilizing tools: {tools_summary}.\n"
+
+        # Add any connected servers whose tools didn't load (pre-fetch failed)
+        for srv_name in state.get("mcp_servers", {}).keys():
+            if srv_name not in all_mcp_tools:
+                server_descriptions += f"- '{srv_name}': Connected server (tools loading).\n"
 
         classification_prompt = (
             "Analyze the following user query and conversation history, and classify it into one of three execution categories:\n\n"
@@ -299,8 +309,10 @@ async def stream_agent_interaction(
 
         if "Local" in tool_groups and state.get("uploaded_files"):
             read_file_tool = get_read_uploaded_file_tool(UPLOAD_DIR)
+            prepare_upload_tool = get_prepare_file_for_upload_tool(UPLOAD_DIR)
             tools.append(read_file_tool)
-            logger.info("[CHAT] Equipped agent with file reading tool 'read_uploaded_file'.")
+            tools.append(prepare_upload_tool)
+            logger.info("[CHAT] Equipped agent with 'read_uploaded_file' and 'prepare_file_for_upload' tools.")
 
         if "Local" in tool_groups and state.get("loaded_docs"):
             doc_search_tool = get_query_documentation_tool(state["loaded_docs"])

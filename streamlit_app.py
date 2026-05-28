@@ -259,7 +259,7 @@ with st.sidebar:
         {"icon": "💬", "name": "G-Chat", "url": "https://chatmcp.googleapis.com/mcp/v1"},
         {"icon": "🗓️", "name": "G-Cal", "url": "https://calendarmcp.googleapis.com/mcp/v1"},
         {"icon": "🟠", "name": "HubSpot", "url": "https://mcp.hubspot.com"},
-        {"icon": "🦁", "name": "Zoho", "url": "https://mcpweb-60071985865.zohomcp.in/mcp/2e064eef500727b574412be4cba964b3/message"},
+        {"icon": "🦁", "name": "Zoho", "url": "https://mcpweb-60071985865.zohomcp.in/mcp/a6f901b40a8dbfe4a1ff06b04fc16bdf/message"},
         {"icon": "🟦", "name": "MS Work IQ", "url": "https://mcp.svc.cloud.microsoft/enterprise"}
     ]
     

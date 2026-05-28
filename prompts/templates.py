@@ -53,15 +53,25 @@ def build_system_prompt(state: Dict[str, Any], active_groups: List[str] = None) 
     if state.get("uploaded_files"):
         prompt += "### Uploaded Local Documents:\n"
         prompt += (
-            "You have access to the following documents uploaded by the user to the local server workspace. "
-            "If the user asks you to read, analyze, search, process, or upload/send any of these files to an external "
-            "service (like Google Drive, Gmail, or Notion), you MUST first read the file's content using the "
-            "`read_uploaded_file` tool, and then call the appropriate external tool (e.g., Google's own `create_file` tool) "
-            "with that exact text content!\n"
-            "⚠️ CRITICAL: When uploading a PDF, DOCX, or other binary document using Google's `create_file` tool, you must "
-            "pass the plain text content returned by the `read_uploaded_file` tool as the `textContent` argument. "
-            "NEVER use placeholders like '[Binary content of CV_TilakVasani.pdf]' or binary representations, as this will "
-            "result in execution errors or corrupt files. Simply upload the clean extracted text!\n"
+            "You have access to the following documents uploaded by the user to the local server workspace.\n\n"
+
+            "**RULE 1 — Reading / Analysing a file:**\n"
+            "Use `read_uploaded_file` to extract and read text from a file "
+            "(PDF, DOCX, TXT, CSV, etc.) for analysis, summarisation, or answering questions.\n\n"
+
+            "**RULE 2 — Uploading a file to Google Drive:**\n"
+            "ALWAYS call `prepare_file_for_upload` FIRST. It returns JSON with:\n"
+            "  • `content`   — base64-encoded binary (for PDF/DOCX/images) or plain text (for .txt/.csv)\n"
+            "  • `mime_type` — the correct MIME type Google Drive requires\n"
+            "  • `encoding`  — either 'base64' or 'text'\n"
+            "Then pass those values directly to Google Drive's `create_file` tool.\n"
+            "⚠️ NEVER call `read_uploaded_file` and pass its extracted text to Google Drive's "
+            "`create_file` — that causes 'invalid document' errors because Google Drive expects "
+            "raw binary content (base64), NOT extracted text.\n\n"
+
+            "**RULE 3 — Attaching a file to Gmail:**\n"
+            "Call `prepare_file_for_upload` first to get the base64 content and mime_type, "
+            "then pass them as the attachment fields in Gmail's send tool.\n"
         )
         for f in state["uploaded_files"]:
             prompt += (

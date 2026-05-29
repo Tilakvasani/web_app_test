@@ -298,14 +298,6 @@ async def _discover_llms_txt(url: str) -> Optional[Dict[str, str]]:
 async def _register_client(metadata: Dict[str, Any], redirect_uri: str, client_name: str) -> Dict[str, Any]:
     """
     Executes dynamic client registration (RFC 7591) with the discovered OAuth2 server.
-
-    Args:
-        metadata (Dict[str, Any]): Discovered OAuth authorization server metadata endpoints.
-        redirect_uri (str): Authorized callback URI endpoint registered for the client app.
-        client_name (str): Human-readable name of the client application.
-
-    Returns:
-        Dict[str, Any]: Registration response payload containing client_id and client_secret.
     """
     reg_endpoint = metadata.get("registration_endpoint")
     if not reg_endpoint:
@@ -328,6 +320,76 @@ async def _register_client(metadata: Dict[str, Any], redirect_uri: str, client_n
         )
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"Client registration failed ({resp.status_code}): {resp.text}")
+        return resp.json()
+
+
+def _build_pkce_state(
+    name: str,
+    mcp_url: str,
+    oauth_meta: Dict[str, Any],
+    client_id: str,
+    client_secret: Optional[str],
+    redirect_uri: str,
+) -> tuple:
+    """
+    Generate a PKCE code_verifier + code_challenge pair, store the OAuth flow
+    state, and return (state_str, code_challenge, code_verifier).
+
+    Extracted from the auto-discover and manual OAuth init paths to eliminate
+    the duplicated 15-line PKCE block that previously existed in both.
+    """
+    code_verifier = secrets.token_urlsafe(64)
+    hashed = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+    code_challenge = base64.urlsafe_b64encode(hashed).decode("utf-8").replace("=", "")
+    state_str = secrets.token_urlsafe(16)
+
+    oauth_flows = load_oauth_flows()
+    oauth_flows[state_str] = {
+        "name": name,
+        "url": mcp_url,
+        "code_verifier": code_verifier,
+        "redirect_uri": redirect_uri,
+        "endpoints": oauth_meta,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    save_oauth_flows(oauth_flows)
+    return state_str, code_challenge, code_verifier
+
+
+async def _exchange_code_for_token(
+    token_endpoint: str,
+    code: str,
+    redirect_uri: str,
+    client_id: str,
+    code_verifier: str,
+    client_secret: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Perform the Authorization Code → Token exchange (RFC 6749 §4.1.3).
+
+    Extracted from oauth_callback so the identical POST logic is not
+    copy-pasted across auto-discover and manual OAuth flows.
+    """
+    data: Dict[str, str] = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": client_id,
+        "code_verifier": code_verifier,
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            token_endpoint,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            timeout=15.0,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Token exchange failed ({resp.status_code}): {resp.text}")
         return resp.json()
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
@@ -428,8 +490,8 @@ async def connect_resource(body: ConnectRequest):
                 raise HTTPException(status_code=400, detail="Server does not support auto-discovered OAuth.")
                 
             try:
-                redirect_uri = "http://localhost:8000/api/mcp/oauth/callback"
                 client_name = state.get("user_name", "Tilak") or f"{detected_name} Client"
+                redirect_uri = "http://localhost:8000/api/mcp/oauth/callback"
                 
                 registered = state.get("registered_clients", {}).get(mcp_url)
                 if not registered:
@@ -462,23 +524,12 @@ async def connect_resource(body: ConnectRequest):
                     
                 client_id = registered["client_id"]
                 client_secret = registered.get("client_secret")
-                
-                code_verifier = secrets.token_urlsafe(64)
-                hashed = hashlib.sha256(code_verifier.encode('utf-8')).digest()
-                code_challenge = base64.urlsafe_b64encode(hashed).decode('utf-8').replace('=', '')
-                state_str = secrets.token_urlsafe(16)
-                
-                oauth_flows = load_oauth_flows()
-                oauth_flows[state_str] = {
-                    "name": detected_name,
-                    "url": mcp_url,
-                    "code_verifier": code_verifier,
-                    "redirect_uri": redirect_uri,
-                    "endpoints": oauth_meta,
-                    "client_id": client_id,
-                    "client_secret": client_secret
-                }
-                save_oauth_flows(oauth_flows)
+
+                redirect_uri = "http://localhost:8000/api/mcp/oauth/callback"
+                state_str, code_challenge, _ = _build_pkce_state(
+                    detected_name, mcp_url, oauth_meta,
+                    client_id, client_secret, redirect_uri
+                )
                 
                 params = {
                     "response_type": "code",
@@ -509,24 +560,12 @@ async def connect_resource(body: ConnectRequest):
                     "authorization_endpoint": body.oauth_auth_endpoint,
                     "token_endpoint": body.oauth_token_endpoint
                 }
-                
-                code_verifier = secrets.token_urlsafe(64)
-                hashed = hashlib.sha256(code_verifier.encode('utf-8')).digest()
-                code_challenge = base64.urlsafe_b64encode(hashed).decode('utf-8').replace('=', '')
-                state_str = secrets.token_urlsafe(16)
-                
-                oauth_flows = load_oauth_flows()
-                oauth_flows[state_str] = {
-                    "name": detected_name,
-                    "url": mcp_url,
-                    "code_verifier": code_verifier,
-                    "redirect_uri": redirect_uri,
-                    "endpoints": oauth_meta,
-                    "client_id": body.oauth_client_id,
-                    "client_secret": body.oauth_client_secret
-                }
-                save_oauth_flows(oauth_flows)
-                
+
+                state_str, code_challenge, _ = _build_pkce_state(
+                    detected_name, mcp_url, oauth_meta,
+                    body.oauth_client_id, body.oauth_client_secret, redirect_uri
+                )
+
                 params = {
                     "response_type": "code",
                     "client_id": body.oauth_client_id,
@@ -616,61 +655,50 @@ async def oauth_callback(code: str, state: str):
     try:
         endpoints = flow["endpoints"]
         token_endpoint = endpoints["token_endpoint"]
-        
-        data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": flow["redirect_uri"],
-            "client_id": flow["client_id"],
-            "code_verifier": flow["code_verifier"]
+
+        # Use the shared helper — no more copy-pasted POST boilerplate here
+        tokens = await _exchange_code_for_token(
+            token_endpoint=token_endpoint,
+            code=code,
+            redirect_uri=flow["redirect_uri"],
+            client_id=flow["client_id"],
+            code_verifier=flow["code_verifier"],
+            client_secret=flow.get("client_secret"),
+        )
+
+        access_token = tokens["access_token"]
+        refresh_token = tokens.get("refresh_token")
+        expires_in = tokens.get("expires_in", 3600)
+
+        server_url = flow["url"]
+        state_dict = load_state()
+        server_name = _get_unique_server_name(flow["name"], server_url, state_dict)
+
+        # Fetch tools to verify connection works
+        tools, working_transport = await _try_connect_mcp(server_name, server_url, "bearer", access_token)
+        tool_names = [t.name for t in tools]
+
+        state_dict["mcp_servers"][server_name] = {
+            "url": server_url,
+            "auth_type": "bearer",
+            "auth_value": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": time.time() + expires_in,
+            "transport": working_transport,
+            "oauth_endpoints": endpoints,
+            "client_credentials": {
+                "client_id": flow["client_id"],
+                "client_secret": flow.get("client_secret")
+            },
+            "tools": tool_names
         }
-        if flow.get("client_secret"):
-            data["client_secret"] = flow["client_secret"]
-            
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                token_endpoint,
-                data=data,
-                headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-                timeout=15.0
-            )
-            if resp.status_code != 200:
-                raise RuntimeError(f"Token exchange failed: {resp.text}")
-                
-            tokens = resp.json()
-            access_token = tokens["access_token"]
-            refresh_token = tokens.get("refresh_token")
-            expires_in = tokens.get("expires_in", 3600)
-            
-            server_url = flow["url"]
-            state_dict = load_state()
-            server_name = _get_unique_server_name(flow["name"], server_url, state_dict)
-            
-            # Fetch tools to verify
-            tools, working_transport = await _try_connect_mcp(server_name, server_url, "bearer", access_token)
-            tool_names = [t.name for t in tools]
-            
-            state_dict["mcp_servers"][server_name] = {
-                "url": server_url,
-                "auth_type": "bearer",
-                "auth_value": access_token,
-                "refresh_token": refresh_token,
-                "expires_at": time.time() + expires_in,
-                "transport": working_transport,
-                "oauth_endpoints": endpoints,
-                "client_credentials": {
-                    "client_id": flow["client_id"],
-                    "client_secret": flow.get("client_secret")
-                },
-                "tools": tool_names
-            }
-            save_state(state_dict)
-            
-            oauth_flows.pop(state, None)
-            save_oauth_flows(oauth_flows)
-            
-            logger.info(f"[OAUTH SUCCESS] Successfully connected server '{server_name}'.")
-            return RedirectResponse(url=f"http://localhost:8501/?oauth_success=1&server_name={quote(server_name)}")
+        save_state(state_dict)
+
+        oauth_flows.pop(state, None)
+        save_oauth_flows(oauth_flows)
+
+        logger.info(f"[OAUTH SUCCESS] Successfully connected server '{server_name}'.")
+        return RedirectResponse(url=f"http://localhost:8501/?oauth_success=1&server_name={quote(server_name)}")
     except Exception as e:
         logger.error(f"[OAUTH CALLBACK ERROR] OAuth callback failed: {e}")
         return RedirectResponse(url=f"http://localhost:8501/?oauth_error={quote(str(e))}")

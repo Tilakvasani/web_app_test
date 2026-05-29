@@ -24,6 +24,7 @@ Key differences from Redis version:
   - TTLs are enforced lazily (on next GET) via an internal expiry index.
 """
 
+import asyncio
 import fnmatch
 import logging
 import time
@@ -67,14 +68,14 @@ class LangGraphMemoryManager:
 
     def __init__(self):
         # ── LangGraph primitives ───────────────────────────────────────────────
-        # checkpointer: pass this to create_react_agent as `checkpointer=`
         self.checkpointer = MemorySaver()
-        # store: general-purpose namespace K/V (sifter, tool resp, embeddings)
         self._store = InMemoryStore()
 
         # Manual TTL index: key → unix expiry timestamp
-        # InMemoryStore has no native TTL; we enforce it lazily on GET.
         self._expiry: dict[str, float] = {}
+
+        # Background cleanup task handle (started on first connect())
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     # ── Startup / Shutdown (no-ops — kept for API parity with AsyncHybridCache) ─
 
@@ -83,11 +84,48 @@ class LangGraphMemoryManager:
             "[MEMORY] ✅ LangGraph InMemoryStore + MemorySaver active "
             "(no external connection needed — Redis removed)."
         )
+        # Bug #20 fix: start a background task that proactively evicts expired
+        # keys every 5 minutes.  Without this, keys with a TTL that are never
+        # re-read stay in _store and _expiry forever, causing unbounded growth.
+        if self._cleanup_task is None or self._cleanup_task.done():
+            try:
+                self._cleanup_task = asyncio.create_task(self._ttl_cleanup_loop())
+                logger.info("[MEMORY] Background TTL cleanup task started (interval: 5 min).")
+            except RuntimeError:
+                # No running event loop yet (e.g. called from a sync context at
+                # import time).  The task will be started on the first await.
+                pass
         return True
 
-    async def disconnect(self):
-        """No-op — nothing to close."""
-        pass
+    async def _ttl_cleanup_loop(self) -> None:
+        """Periodically evict all keys whose TTL has elapsed."""
+        while True:
+            try:
+                await asyncio.sleep(300)   # every 5 minutes
+                await self._evict_expired()
+            except asyncio.CancelledError:
+                logger.info("[MEMORY] TTL cleanup task cancelled.")
+                break
+            except Exception as e:
+                logger.warning(f"[MEMORY] TTL cleanup error: {e}")
+
+    async def _evict_expired(self) -> None:
+        """Delete every key whose expiry timestamp is in the past."""
+        now = time.time()
+        expired = [k for k, exp in list(self._expiry.items()) if exp < now]
+        for key in expired:
+            await self.delete(key)
+        if expired:
+            logger.info(f"[MEMORY] TTL sweep evicted {len(expired)} expired key(s).")
+
+    async def disconnect(self) -> None:
+        """Cancel the background cleanup task and release resources."""
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
 
     # ── Properties ─────────────────────────────────────────────────────────────
 

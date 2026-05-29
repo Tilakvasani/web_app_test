@@ -6,6 +6,7 @@ for initializing Azure OpenAI models and generating multi-server connection conf
 """
 
 import os
+import logging
 from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI
 
@@ -21,22 +22,40 @@ UPLOAD_DIR = "uploaded_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+_cfg_logger = logging.getLogger("mcp_backend")
+
+
 # LLM Deployment Setup
 def get_llm() -> AzureChatOpenAI:
     """
     Initializes and returns the primary Azure OpenAI Chat model client.
 
-    Retrieves connection endpoints, API keys, and deployment names from 
+    Retrieves connection endpoints, API keys, and deployment names from
     the active environment variables, with support for streaming responses.
 
     Returns:
         AzureChatOpenAI: Instantiated LangChain-compliant Azure OpenAI chat model client.
     """
+    deployment = (
+        os.getenv("AZURE_OPENAI_DEPLOYMENT") or
+        os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+    )
+    if not deployment:
+        # Bug #18 fix: the hard-coded default "gpt-4.1-mini" will not exist on
+        # most Azure instances. Log a clear warning so it's obvious at startup.
+        _cfg_logger.warning(
+            "[CONFIG] ⚠️  Neither AZURE_OPENAI_DEPLOYMENT nor AZURE_OPENAI_DEPLOYMENT_NAME "
+            "is set in your .env file. Falling back to 'gpt-4.1-mini' — this deployment "
+            "almost certainly does not exist on your Azure instance and every LLM call "
+            "will fail with a 404. Please set AZURE_OPENAI_DEPLOYMENT in your .env."
+        )
+        deployment = "gpt-4.1-mini"
+
     return AzureChatOpenAI(
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
-        azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or "gpt-4.1-mini",
+        azure_deployment=deployment,
         streaming=True,
     )
 

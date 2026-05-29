@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import re
-import tiktoken
 from typing import Dict, Any, List, AsyncGenerator
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -42,31 +41,9 @@ from tools import (
     web_search,
     web_scrape
 )
+from utils.token_counter import count_tokens
 
 logger = logging.getLogger("mcp_backend")
-
-# ── Tiktoken encoder (module-level singleton) ──────────────────────────────────
-_TIKTOKEN_ENC = None
-
-def _get_encoder():
-    global _TIKTOKEN_ENC
-    if _TIKTOKEN_ENC is None:
-        try:
-            _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
-        except Exception:
-            pass
-    return _TIKTOKEN_ENC
-
-
-def count_tokens(text: str) -> int:
-    try:
-        enc = _get_encoder()
-        if enc:
-            return len(enc.encode(text))
-    except Exception:
-        pass
-    return len(text) // 4
-
 
 # ── Thread tracking ────────────────────────────────────────────────────────────
 # Tracks which thread_ids have already been seeded into the MemorySaver.
@@ -164,9 +141,12 @@ async def stream_agent_interaction(
     # ── 0. Decide input messages based on thread state ─────────────────────────
     is_new_thread = thread_id not in _INITIALIZED_THREADS
 
+    # Always compute compressed_history so the planning phase can reference it
+    # regardless of whether this is a new or existing thread.
+    compressed_history = await compress_history_sandwich(history, llm_inst)
+
     if is_new_thread:
-        # First time: compress + seed the checkpoint with prior context
-        compressed_history = await compress_history_sandwich(history, llm_inst)
+        # First time: seed the checkpoint with compressed prior context
         msgs = []
         for h in compressed_history:
             role    = h.get("role")
@@ -190,7 +170,13 @@ async def stream_agent_interaction(
     if state.get("mcp_servers"):
         servers_to_fetch = {}
         for name, s in state["mcp_servers"].items():
-            srv_key = f"{name}:{s.get('url')}"
+            # Normalize URL: keep only scheme+netloc+path, strip query/fragment
+            # so auth tokens in query params don't create stale cache entries.
+            from urllib.parse import urlparse
+            _raw_url = s.get("url", "")
+            _p = urlparse(_raw_url)
+            _clean_url = f"{_p.scheme}://{_p.netloc}{_p.path}"
+            srv_key = f"{name}:{_clean_url}"
             if srv_key in _MCP_TOOLS_CACHE:
                 all_mcp_tools[name] = _MCP_TOOLS_CACHE[srv_key]
             else:
@@ -297,6 +283,31 @@ async def stream_agent_interaction(
         needs_plan = needs_tools = True
         tool_groups = list(state.get("mcp_servers", {}).keys()) + ["Local"]
 
+        # Bug #8 fix: if tool-fetch in step 1 also failed for some servers,
+        # attempt a second fetch now so the agent actually has tools available.
+        if state.get("mcp_servers"):
+            from urllib.parse import urlparse as _up
+            missing = {
+                name: s
+                for name, s in state["mcp_servers"].items()
+                if name not in all_mcp_tools
+            }
+            if missing:
+                logger.info(f"[PLANNER FALLBACK] Re-fetching tools for: {list(missing.keys())}")
+                for name, s in missing.items():
+                    try:
+                        _p = _up(s.get("url", ""))
+                        srv_key = f"{name}:{_p.scheme}://{_p.netloc}{_p.path}"
+                        transport = s.get("transport", "streamable_http")
+                        cfg = _make_cfg(s["url"], s["auth_type"], s["auth_value"], transport=transport)
+                        single_client = MultiServerMCPClient({name: cfg})
+                        mcp_tools = await single_client.get_tools()
+                        _MCP_TOOLS_CACHE[srv_key] = mcp_tools
+                        all_mcp_tools[name] = mcp_tools
+                        logger.info(f"[PLANNER FALLBACK] Re-fetched {len(mcp_tools)} tools from '{name}'.")
+                    except Exception as refetch_err:
+                        logger.error(f"[PLANNER FALLBACK] Re-fetch still failed for '{name}': {refetch_err}")
+
     # ── 3. Resolve tools ───────────────────────────────────────────────────────
     tools = []
 
@@ -326,7 +337,7 @@ async def stream_agent_interaction(
     # ── 4. Strategic Planning Phase ───────────────────────────────────────────
     if needs_plan:
         logger.info("[PLANNER] Running pre-execution strategic planning...")
-        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Creating strategic execution plan...'})}\\n\\n"
+        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Creating strategic execution plan...'})}"
 
         try:
             planning_system_prompt = (
@@ -351,7 +362,7 @@ async def stream_agent_interaction(
                 total_output_tokens += plan_response.usage_metadata.get("output_tokens", 0)
 
             plan_text = plan_response.content if hasattr(plan_response, "content") else str(plan_response)
-            yield f"event: thought\ndata: {json.dumps({'text': f'📋 **Strategic Plan**:\\n{plan_text}'})}\\n\\n"
+            yield f"event: thought\ndata: {json.dumps({'text': f'📋 **Strategic Plan**:{plan_text}'})}"
         except Exception as plan_err:
             logger.error(f"[PLANNER ERROR] {plan_err}")
             plan_text = "Step 1: Directly process request using available tools."
@@ -380,7 +391,7 @@ async def stream_agent_interaction(
     # ── 6. Execute agent with LangGraph MemorySaver ───────────────────────────
     logger.info(f"[AGENT] Streaming with thread_id='{thread_id}', tools={len(tools)}")
     if needs_plan:
-        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Executing plan with dynamic tools...'})}\\n\\n"
+        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Executing plan with dynamic tools...'})}"
 
     thread_config = {"configurable": {"thread_id": thread_id}}
 
@@ -403,15 +414,15 @@ async def stream_agent_interaction(
                         if getattr(msg, "tool_calls", None):
                             for tc in msg.tool_calls:
                                 logger.info(f"[AGENT THOUGHT] Tool call: {tc['name']}")
-                                yield f"event: tool_call\ndata: {json.dumps({'name': tc['name'], 'args': tc['args']})}\\n\\n"
+                                yield f"event: tool_call\ndata: {json.dumps({'name': tc['name'], 'args': tc['args']})}"
 
                         if hasattr(msg, "content") and msg.content:
-                            yield f"event: content\ndata: {json.dumps({'text': msg.content})}\\n\\n"
+                            yield f"event: content\ndata: {json.dumps({'text': msg.content})}"
 
                 elif "tools" in chunk:
                     for msg in chunk["tools"]["messages"]:
                         logger.info(f"[TOOL RESPONSE] {msg.name}")
-                        yield f"event: tool_output\ndata: {json.dumps({'name': msg.name, 'content': str(msg.content)})}\\n\\n"
+                        yield f"event: tool_output\ndata: {json.dumps({'name': msg.name, 'content': str(msg.content)})}"
         else:
             # Conversational path — no tools, no checkpointer needed
             logger.info("[CHAT] No tools. Streaming direct LLM response...")
@@ -422,14 +433,14 @@ async def stream_agent_interaction(
             async for token_chunk in llm_inst.astream(full_msgs):
                 if token_chunk.content:
                     full_response += token_chunk.content
-                    yield f"event: content\ndata: {json.dumps({'text': token_chunk.content})}\\n\\n"
+                    yield f"event: content\ndata: {json.dumps({'text': token_chunk.content})}"
             total_output_tokens += count_tokens(full_response)
 
-        yield f"event: token_usage\ndata: {json.dumps({'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens})}\\n\\n"
-        yield f"event: thought\ndata: {json.dumps({'text': '✅ Completed successfully'})}\\n\\n"
+        yield f"event: token_usage\ndata: {json.dumps({'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens})}"
+        yield f"event: thought\ndata: {json.dumps({'text': '✅ Completed successfully'})}"
 
     except Exception as e:
         logger.error(f"[CHAT ERROR] {e}", exc_info=True)
         from routes.state_routes import unpack_exception
         clean_msg = unpack_exception(e)
-        yield f"event: error\ndata: {json.dumps({'message': clean_msg})}\\n\\n"
+        yield f"event: error\ndata: {json.dumps({'message': clean_msg})}"

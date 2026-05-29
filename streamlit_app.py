@@ -6,6 +6,7 @@ manages session state metrics, and intercepts CLI slash command autocompletion l
 """
 
 import json
+import uuid
 import httpx
 import streamlit as st
 from urllib.parse import quote
@@ -80,6 +81,12 @@ if "token_usage" not in st.session_state:
     }
 if "oauth_flow_pending" not in st.session_state:
     st.session_state.oauth_flow_pending = None
+
+# Stable conversation identity for LangGraph MemorySaver.
+# Generated once per browser session; regenerated after /clear so the next
+# conversation starts with a clean checkpoint.
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
 
 # Proactively sync active sessions
 sync_state()
@@ -582,6 +589,16 @@ if prompt:
     if prompt.startswith("/"):
         # Check for /clear shortcut
         if prompt.strip().lower() == "/clear":
+            # Wipe backend LangGraph checkpoint so old memory is truly gone
+            try:
+                httpx.delete(
+                    f"{BACKEND_URL}/api/clear_thread/{st.session_state.thread_id}",
+                    timeout=5.0,
+                )
+            except Exception:
+                pass  # Best-effort; frontend clear still proceeds
+            # Issue a fresh thread_id so the next message starts a clean slate
+            st.session_state.thread_id = str(uuid.uuid4())
             st.session_state.history = []
             st.session_state.token_usage = {
                 "session_total_tokens": 0,
@@ -666,7 +683,8 @@ if prompt:
             try:
                 payload = {
                     "prompt": prompt,
-                    "history": st.session_state.history[:-1]
+                    "history": st.session_state.history[:-1],
+                    "thread_id": st.session_state.thread_id,
                 }
                 
                 # Initiate HTTP/SSE streaming connection to FastAPI

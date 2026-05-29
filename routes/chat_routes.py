@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, validator
 from langchain_core.messages import HumanMessage
-
+from typing import Optional
 from config import get_llm, UPLOAD_DIR, _make_cfg
 from database import load_state, save_state
 from agents import stream_agent_interaction
@@ -25,6 +25,13 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 logger = logging.getLogger("mcp_backend")
 router = APIRouter()
+
+# ── MCP Client Pool ────────────────────────────────────────────────────────────
+# Keyed by (server_name, url, auth_value) — if a token rotates, the old entry is
+# evicted automatically when the call fails and a fresh client is created.
+# This avoids creating a new MultiServerMCPClient (and opening a new HTTP
+# connection) on every single call_mcp_tool_directly invocation.
+_MCP_CLIENT_POOL: Dict[tuple, Any] = {}
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
 
@@ -51,33 +58,71 @@ class ChatRequest(BaseModel):
 class CommandRequest(BaseModel):
     command: str
 
+# ── Helper to find a connected server by URL pattern ──────────────────────────
+def _find_server_by_url(state: dict, *url_keywords: str) -> Optional[str]:
+    """
+    Returns the first server name whose URL contains ANY of the given keywords.
+    Use this instead of hard-coding exact server names like "HubSpot" or "Zoho",
+    which breaks the moment a user registers the server under a different name.
+
+    Example:
+        _find_server_by_url(state, "hubspot", "hubapi")  # finds HubSpot
+        _find_server_by_url(state, "zoho")               # finds Zoho
+    """
+    for name, s in state.get("mcp_servers", {}).items():
+        url_lower = s.get("url", "").lower()
+        if any(kw in url_lower for kw in url_keywords):
+            return name
+    return None
+
 # ── Helper to Call MCP Tools Dynamically ──────────────────────────────────────
 async def call_mcp_tool_directly(server_name: str, tool_name: str, tool_args: dict, state: dict) -> Any:
-    """Helper to invoke a specific MCP tool directly from the backend."""
+    """
+    Invoke a specific MCP tool directly.  Reuses a pooled MultiServerMCPClient
+    per (server_name, url, auth_value) so we don't open a new connection on
+    every call.  On error the pool entry is evicted so the next call gets a
+    fresh client (handles rotated tokens automatically).
+    """
     if not state.get("mcp_servers") or server_name not in state["mcp_servers"]:
         raise ValueError(f"Server '{server_name}' is not connected.")
-    
+
     s = state["mcp_servers"][server_name]
     transport = s.get("transport", "streamable_http")
     cfg = _make_cfg(s["url"], s["auth_type"], s["auth_value"], transport=transport)
     if s.get("api_header") and s.get("auth_type") == "api_key":
         cfg["headers"] = {s["api_header"]: s["auth_value"]}
 
-    # langchain-mcp-adapters 0.1.0 API: no async with, just client.get_tools()
+    pool_key = (server_name, s["url"], s.get("auth_value", ""))
     try:
-        client = MultiServerMCPClient({server_name: cfg})
+        if pool_key not in _MCP_CLIENT_POOL:
+            _MCP_CLIENT_POOL[pool_key] = MultiServerMCPClient({server_name: cfg})
+            logger.info(f"[MCP POOL] New client created for '{server_name}'.")
+        client = _MCP_CLIENT_POOL[pool_key]
         tools = await client.get_tools()
-        tool = next((t for t in tools if t.name == tool_name), None)
-        if tool is None:
+        tool_obj = next((t for t in tools if t.name == tool_name), None)
+        if tool_obj is None:
             raise ValueError(
                 f"Tool '{tool_name}' not found on server '{server_name}'. "
-                f"Available tools: {[t.name for t in tools]}"
+                f"Available: {[t.name for t in tools]}"
             )
-        res = await tool.ainvoke(tool_args)
-        return res
+        return await tool_obj.ainvoke(tool_args)
     except Exception as e:
-        logger.error(f"Direct MCP tool call failed: {e}")
-        raise e
+        # Evict stale client — token may have rotated or connection dropped
+        _MCP_CLIENT_POOL.pop(pool_key, None)
+        logger.error(f"[MCP TOOL] {server_name}.{tool_name} failed: {e}")
+        raise
+
+async def _safe_mcp_call(server_name: str, tool_name: str, tool_args: dict, state: dict, fallback: Any = None) -> Any:
+    """
+    Wrapper around call_mcp_tool_directly that returns *fallback* instead of
+    raising, and logs the error.  Use for non-critical lookups where you want
+    graceful degradation rather than a hard exception.
+    """
+    try:
+        return await call_mcp_tool_directly(server_name, tool_name, tool_args, state)
+    except Exception as e:
+        logger.warning(f"[MCP SAFE CALL] {server_name}.{tool_name} failed: {e}")
+        return fallback
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
@@ -309,17 +354,19 @@ async def execute_command(body: CommandRequest):
                 # Step 2: Search CRM/HubSpot/Zoho for the website link
                 found_url = ""
                 crm_source = ""
-                
-                # FIX: Use the correct HubSpot tool name — "get_companies" does not exist.
-                # The actual tool exposed by HubSpot MCP is "search_crm_objects".
-                if "HubSpot" in state.get("mcp_servers", {}):
+
+                # FIX (Bug #10): Match servers by URL pattern, not hard-coded name.
+                # A user may register HubSpot as "HS", "My HubSpot", etc.
+                hubspot_server = _find_server_by_url(state, "hubspot", "hubapi")
+                zoho_server    = _find_server_by_url(state, "zoho")
+
+                if hubspot_server:
                     try:
                         crm_res = await call_mcp_tool_directly(
-                            "HubSpot", "search_crm_objects",
+                            hubspot_server, "search_crm_objects",
                             {"objectType": "companies", "properties": ["name", "domain"], "limit": 50},
                             state
                         )
-                        # Let LLM find company link from CRM dump
                         find_link_prompt = (
                             f"Find the website URL for the company named '{company}' from this HubSpot CRM company list:\n"
                             f"{str(crm_res)}\n"
@@ -333,12 +380,9 @@ async def execute_command(body: CommandRequest):
                     except Exception as e:
                         logger.warning(f"Failed to lookup company in HubSpot: {e}")
 
-                # Check Zoho if not found in HubSpot
-                if not found_url and "Zoho" in state.get("mcp_servers", {}):
+                if not found_url and zoho_server:
                     try:
-                        # Dynamic search module
-                        crm_res = await call_mcp_tool_directly("Zoho", "ZohoPeople.forms.READ", {}, state) # Fallback probe module
-                        # Let LLM locate Zoho accounts/leads if any
+                        crm_res = await _safe_mcp_call(zoho_server, "ZohoPeople.forms.READ", {}, state, fallback="")
                         find_link_prompt = (
                             f"Find the website URL for the company '{company}' from this Zoho data:\n"
                             f"{str(crm_res)}\n"
@@ -447,13 +491,12 @@ async def execute_command(body: CommandRequest):
                 summary_text = summary_res.content
                 return {"status": "success", "content": f"### 📝 Notion Page Summary (`{target_id}`)\n\n{summary_text}"}
 
-            # Check if Zoho CRM record summarize
             elif source == "zoho" and target_id:
-                if "Zoho" not in state.get("mcp_servers", {}):
+                zoho_server = _find_server_by_url(state, "zoho")
+                if not zoho_server:
                     return {"status": "error", "content": "⚠️ **Zoho MCP server is not connected.**"}
                 try:
-                    # Fallback generic retrieval via People/CRM
-                    zoho_res = await call_mcp_tool_directly("Zoho", "ZohoPeople.forms.READ", {}, state)
+                    zoho_res = await _safe_mcp_call(zoho_server, "ZohoPeople.forms.READ", {}, state, fallback="")
                     sum_prompt = (
                         f"Summarize this Zoho CRM record information dynamically:\n\n"
                         f"Record ID: {target_id}\n"
@@ -576,3 +619,26 @@ async def execute_command(body: CommandRequest):
     except Exception as cmd_err:
         logger.error(f"[COMMAND ERROR] Command '{command_str}' failed: {cmd_err}", exc_info=True)
         return {"status": "error", "content": f"❌ **Failed to execute command '{cmd}': {str(cmd_err)}**"}
+
+# ── Clear Thread Endpoint ──────────────────────────────────────────────────────
+@router.delete("/api/clear_thread/{thread_id}")
+async def clear_thread(thread_id: str):
+    """
+    Truly resets a conversation by:
+      1. Deleting the LangGraph MemorySaver checkpoint for this thread_id.
+      2. Removing the thread from _INITIALIZED_THREADS so the next call
+         re-seeds it with fresh (empty) history.
+    """
+    from database import checkpointer
+    from agents.react_agent import _INITIALIZED_THREADS
+
+    try:
+        # Remove from LangGraph MemorySaver storage
+        config = {"configurable": {"thread_id": thread_id}}
+        await checkpointer.adelete(config)
+    except Exception as e:
+        logger.warning(f"[CLEAR THREAD] Could not delete checkpoint for '{thread_id}': {e}")
+
+    _INITIALIZED_THREADS.discard(thread_id)
+    logger.info(f"[CLEAR THREAD] Cleared thread '{thread_id}'.")
+    return {"status": "success", "message": f"Thread '{thread_id}' cleared."}

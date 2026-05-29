@@ -54,7 +54,7 @@ KNOWN_OAUTH_SERVERS = {
     },
     "drivemcp.googleapis.com": {
         **GOOGLE_OAUTH_BASE,
-        "scope": "https://www.googleapis.com/auth/drive"
+        "scope": "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file"
     },
     "calendarmcp.googleapis.com": {
         **GOOGLE_OAUTH_BASE,
@@ -66,7 +66,7 @@ KNOWN_OAUTH_SERVERS = {
     },
     "googleapis.com": {
         **GOOGLE_OAUTH_BASE,
-        "scope": "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/chat.spaces.readonly"
+        "scope": "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/chat.spaces.readonly"
     },
 
     "microsoft.com": {
@@ -719,7 +719,13 @@ async def proactively_refresh_server_tokens():
             # gets a new token with drive + drive.file + drive.readonly included.
             # _scope_refreshed flag prevents redundant refreshes on subsequent startups.
             server_url = s.get("url", "")
-            is_google = any(d in server_url.lower() for d in GOOGLE_OAUTH_SPECS.keys())
+            is_google = any(d in server_url.lower() for d in KNOWN_OAUTH_SERVERS.keys())
+
+            # If scopes changed since last login, reset the flag to force a fresh token.
+            expected_scope = next((spec.get("scope", "") for dk, spec in KNOWN_OAUTH_SERVERS.items() if dk in server_url.lower()), "")
+            if is_google and s.get("_last_scope", "") != expected_scope:
+                s["_scope_refreshed"] = False
+
             force_refresh = is_google and not s.get("_scope_refreshed", False)
 
             if force_refresh or time_left < 300: # 5 min limit
@@ -739,7 +745,7 @@ async def proactively_refresh_server_tokens():
                     # FIX: Google requires scope in refresh requests for drivemcp.
                     # Without it, the new access token is issued with reduced/no Drive
                     # permissions and every tool call returns 403 Forbidden.
-                    for domain_key, spec in GOOGLE_OAUTH_SPECS.items():
+                    for domain_key, spec in KNOWN_OAUTH_SERVERS.items():
                         if domain_key in server_url.lower():
                             params["scope"] = spec.get("scope", "")
                             break
@@ -759,6 +765,7 @@ async def proactively_refresh_server_tokens():
                             expires_in = tokens.get("expires_in", 3600)
                             s["expires_at"] = time.time() + expires_in
                             s["_scope_refreshed"] = True  # don't force-refresh again next startup
+                            s["_last_scope"] = expected_scope  # track scope version
                             modified = True
                             logger.info(f"[PROACTIVE REFRESH SUCCESS] Refreshed token for '{name}'.")
                         else:

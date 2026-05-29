@@ -10,6 +10,6 @@ httpx
 pypdf
 python-docx
 tiktoken
-redis[hiredis]
+# redis[hiredis]  # REMOVED — replaced by LangGraph InMemoryStore
 numpy
 anyio==3.7.1

@@ -86,18 +86,18 @@ async def lifespan(app: FastAPI):
     # ── Startup ──
     logger.info("[STARTUP] Bootstrapping FastAPI Server...")
 
+    # LangGraph memory is always available — no external connection needed
     await cache.connect()
 
     try:
         from database import load_state, index_documents_in_redis
-        if cache.is_available:
-            state = load_state()
-            loaded_docs = state.get("loaded_docs", {})
-            if loaded_docs:
-                logger.info(f"[STARTUP] Redis active. Indexing {len(loaded_docs)} documents in vector store...")
-                await index_documents_in_redis(loaded_docs)
-            else:
-                logger.info("[STARTUP] No documents to index in vector store.")
+        state       = load_state()
+        loaded_docs = state.get("loaded_docs", {})
+        if loaded_docs:
+            logger.info(f"[STARTUP] Indexing {len(loaded_docs)} documents into in-memory vector store...")
+            await index_documents_in_redis(loaded_docs)
+        else:
+            logger.info("[STARTUP] No documents to index.")
     except Exception as e:
         logger.error(f"[STARTUP ERROR] Vector store bootstrapping failed: {e}")
 

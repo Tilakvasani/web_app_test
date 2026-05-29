@@ -31,6 +31,11 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     prompt: str
     history: List[Dict[str, str]] = []
+    # thread_id identifies the conversation in LangGraph's MemorySaver.
+    # The frontend should pass a stable session/user ID so conversation history
+    # is automatically managed across turns.  Falls back to "default" so older
+    # clients that don't send this field continue to work.
+    thread_id: str = "default"
 
     # FIX: Validate prompt length to prevent oversized inputs from hitting LLM calls.
     @validator("prompt")
@@ -155,7 +160,7 @@ async def chat_interaction(body: ChatRequest):
         chunks_collected = []
         success = False
         try:
-            async for sse_chunk in stream_agent_interaction(body.prompt, body.history, state):
+            async for sse_chunk in stream_agent_interaction(body.prompt, body.history, state, thread_id=body.thread_id):
                 chunks_collected.append(sse_chunk)
                 yield sse_chunk
                 if "Completed successfully" in sse_chunk or "Completed" in sse_chunk:

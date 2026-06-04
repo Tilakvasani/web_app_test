@@ -6,7 +6,7 @@ Integrates dynamic MCP clients, binds local search/workspace helper tools,
 and coordinates pre-execution strategic planners.
 
 Memory strategy (post-Redis migration):
-  - LangGraph MemorySaver is passed as `checkpointer` to create_agent.
+  - LangGraph MemorySaver is passed as `checkpointer` to create_react_agent.
   - Each conversation is identified by a `thread_id`; LangGraph manages the
     full message state per thread automatically.
   - On the FIRST call for a thread the caller provides prior `history` to seed
@@ -26,7 +26,7 @@ import re
 from typing import Dict, Any, List, AsyncGenerator
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain.agents import create_agent
+from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from config import get_llm, get_cheap_llm, UPLOAD_DIR, _make_cfg
@@ -51,6 +51,36 @@ logger = logging.getLogger("mcp_backend")
 # On every subsequent call we pass only the new user message — LangGraph
 # automatically loads and appends to the existing checkpoint state.
 _INITIALIZED_THREADS: set = set()
+
+
+def _reset_thread_checkpoint(thread_id: str) -> None:
+    """
+    Removes a thread from both the initialized-set and the MemorySaver storage
+    so the next call re-seeds it with clean history.
+
+    Called when dangling tool_calls (AIMessage with no matching ToolMessage)
+    are detected in a checkpoint — either proactively (pre-flight) or reactively
+    (error handler).  Both paths are safe: if the key is already absent the
+    list-comprehension produces an empty list and nothing breaks.
+    """
+    _INITIALIZED_THREADS.discard(thread_id)
+    try:
+        # MemorySaver stores checkpoints in .storage keyed by
+        # (thread_id, checkpoint_ns, checkpoint_id) tuples.
+        keys_to_drop = [
+            k for k in list(checkpointer.storage)
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == thread_id
+        ]
+        for k in keys_to_drop:
+            checkpointer.storage.pop(k, None)
+        logger.info(
+            f"[AGENT] Checkpoint reset for thread '{thread_id}' "
+            f"({len(keys_to_drop)} entries cleared)."
+        )
+    except Exception as ce:
+        logger.warning(
+            f"[AGENT] Could not clear checkpointer storage for '{thread_id}': {ce}"
+        )
 
 
 # ── Dynamic prompt helpers ─────────────────────────────────────────────────────
@@ -629,12 +659,63 @@ async def stream_agent_interaction(
     try:
         if tools:
             # MemorySaver passed as checkpointer — LangGraph handles history per thread_id
-            agent = create_agent(
+            agent = create_react_agent(
                 llm_inst,
                 tools,
                 prompt=system_prompt,
                 checkpointer=checkpointer,
             )
+
+            # ── Pre-flight: heal dangling tool calls before streaming ──────────
+            # If a previous stream was interrupted mid-tool-call (e.g. client
+            # disconnect, server restart) the checkpoint contains an AIMessage
+            # with tool_calls but no matching ToolMessage.  Most LLM providers
+            # reject that history with INVALID_CHAT_HISTORY.  Detect and reset
+            # the thread here so the user never sees the error.
+            if thread_id in _INITIALIZED_THREADS:
+                try:
+                    cp_tuple = await checkpointer.aget_tuple(
+                        {"configurable": {"thread_id": thread_id}}
+                    )
+                    if cp_tuple:
+                        saved_msgs = (
+                            cp_tuple.checkpoint
+                            .get("channel_values", {})
+                            .get("messages", [])
+                        )
+                        call_ids = {
+                            tc["id"]
+                            for m in saved_msgs
+                            for tc in (getattr(m, "tool_calls", None) or [])
+                        }
+                        result_ids = {
+                            getattr(m, "tool_call_id", None)
+                            for m in saved_msgs
+                        }
+                        result_ids.discard(None)
+                        dangling = call_ids - result_ids
+                        if dangling:
+                            logger.warning(
+                                f"[AGENT] Pre-flight: {len(dangling)} dangling tool call(s) "
+                                f"found in thread '{thread_id}'. Auto-resetting checkpoint."
+                            )
+                            _reset_thread_checkpoint(thread_id)
+                            # Re-seed msgs with full compressed history so context is preserved
+                            msgs = []
+                            for h in compressed_history:
+                                role = h.get("role"); content = h.get("content", "")
+                                if role == "user":
+                                    msgs.append(HumanMessage(content=content))
+                                elif role == "assistant":
+                                    msgs.append(AIMessage(content=content))
+                            msgs.append(HumanMessage(content=prompt))
+                            _INITIALIZED_THREADS.add(thread_id)
+                except Exception as pre_err:
+                    logger.warning(
+                        f"[AGENT] Pre-flight checkpoint check failed (non-fatal): {pre_err}"
+                    )
+            # ── End pre-flight ─────────────────────────────────────────────────
+
             async for chunk in agent.astream({"messages": msgs}, config=thread_config):
                 if "agent" in chunk:
                     for msg in chunk["agent"]["messages"]:
@@ -671,6 +752,20 @@ async def stream_agent_interaction(
         yield f"event: thought\ndata: {json.dumps({'text': '✅ Completed successfully'})}\n\n"
 
     except Exception as e:
+        err_str = str(e)
+        # Fallback: if the pre-flight missed a dangling tool call (e.g. the
+        # checkpointer uses a non-standard storage layout), reset the thread so
+        # the NEXT call auto-heals, and surface a clear retry message.
+        if "AIMessages with tool_calls" in err_str or "INVALID_CHAT_HISTORY" in err_str:
+            logger.warning(
+                f"[AGENT] INVALID_CHAT_HISTORY in thread '{thread_id}' — "
+                "resetting checkpoint so next message auto-heals."
+            )
+            _reset_thread_checkpoint(thread_id)
+            yield (
+                f"event: error\ndata: {json.dumps({'message': 'Your conversation history was reset after an interrupted tool call. Please resend your last message and the agent will continue normally.'})}\n\n"
+            )
+            return
         logger.error(f"[CHAT ERROR] {e}", exc_info=True)
         from routes.state_routes import unpack_exception
         clean_msg = unpack_exception(e)

@@ -98,6 +98,18 @@ KNOWN_OAUTH_SERVERS = {
     },
     "zohomcp.in": {
         "mode": "Auto-Discover OAuth (RFC 9470)"
+    },
+    "indeed.com": {
+        "mode": "Manual OAuth2",
+        "auth_endpoint": "https://secure.indeed.com/oauth/v2/authorize",
+        "token_endpoint": "https://apis.indeed.com/oauth/v2/tokens",
+        "scope": "employer_access"
+    },
+    "apis.indeed.com": {
+        "mode": "Manual OAuth2",
+        "auth_endpoint": "https://secure.indeed.com/oauth/v2/authorize",
+        "token_endpoint": "https://apis.indeed.com/oauth/v2/tokens",
+        "scope": "employer_access"
     }
 }
 
@@ -432,13 +444,34 @@ async def connect_resource(body: ConnectRequest):
                     elif "microsoft" in lower_url or "office" in lower_url or "microsoftonline" in lower_url:
                         body.oauth_client_id = body.oauth_client_id or os.getenv("MICROSOFT_CLIENT_ID", "")
                         body.oauth_client_secret = body.oauth_client_secret or os.getenv("MICROSOFT_CLIENT_SECRET", "")
+                    elif "indeed" in lower_url:
+                        body.oauth_client_id = body.oauth_client_id or os.getenv("INDEED_CLIENT_ID", "")
+                        body.oauth_client_secret = body.oauth_client_secret or os.getenv("INDEED_CLIENT_SECRET", "")
                     
     if auth_option == "Manual OAuth2" and (not body.oauth_client_id or not body.oauth_client_id.strip()):
-        provider = "Google" if "google" in lower_url else "HubSpot" if ("hubspot" in lower_url or "hubapi" in lower_url) else "Microsoft" if ("microsoft" in lower_url or "office" in lower_url or "microsoftonline" in lower_url) else "Manual OAuth2"
-        env_var_id = "GOOGLE_CLIENT_ID" if provider == "Google" else "HUBSPOT_CLIENT_ID" if provider == "HubSpot" else "MICROSOFT_CLIENT_ID" if provider == "Microsoft" else "CLIENT_ID"
-        env_var_secret = "GOOGLE_CLIENT_SECRET" if provider == "Google" else "HUBSPOT_CLIENT_SECRET" if provider == "HubSpot" else "MICROSOFT_CLIENT_SECRET" if provider == "Microsoft" else "CLIENT_SECRET"
+        provider = (
+            "Google" if "google" in lower_url else
+            "HubSpot" if ("hubspot" in lower_url or "hubapi" in lower_url) else
+            "Microsoft" if ("microsoft" in lower_url or "office" in lower_url or "microsoftonline" in lower_url) else
+            "Indeed" if "indeed" in lower_url else
+            "Manual OAuth2"
+        )
+        env_var_id = (
+            "GOOGLE_CLIENT_ID" if provider == "Google" else
+            "HUBSPOT_CLIENT_ID" if provider == "HubSpot" else
+            "MICROSOFT_CLIENT_ID" if provider == "Microsoft" else
+            "INDEED_CLIENT_ID" if provider == "Indeed" else
+            "CLIENT_ID"
+        )
+        env_var_secret = (
+            "GOOGLE_CLIENT_SECRET" if provider == "Google" else
+            "HUBSPOT_CLIENT_SECRET" if provider == "HubSpot" else
+            "MICROSOFT_CLIENT_SECRET" if provider == "Microsoft" else
+            "INDEED_CLIENT_SECRET" if provider == "Indeed" else
+            "CLIENT_SECRET"
+        )
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"{provider} OAuth credentials are missing. Please define '{env_var_id}' and '{env_var_secret}' in your backend '.env' file to authorize {provider} API services."
         )
 

@@ -81,6 +81,8 @@ if "token_usage" not in st.session_state:
     }
 if "oauth_flow_pending" not in st.session_state:
     st.session_state.oauth_flow_pending = None
+if "oauth_cred_prompt" not in st.session_state:
+    st.session_state.oauth_cred_prompt = None
 
 # Stable conversation identity for LangGraph MemorySaver.
 # Generated once per browser session; regenerated after /clear so the next
@@ -267,7 +269,13 @@ with st.sidebar:
         {"icon": "🗓️", "name": "G-Cal", "url": "https://calendarmcp.googleapis.com/mcp/v1"},
         {"icon": "🟠", "name": "HubSpot", "url": "https://mcp.hubspot.com"},
         {"icon": "🦁", "name": "Zoho", "url": "https://mcpweb-60071985865.zohomcp.in/mcp/a6f901b40a8dbfe4a1ff06b04fc16bdf/message"},
-        {"icon": "🟦", "name": "MS Work IQ", "url": "https://mcp.svc.cloud.microsoft/enterprise"}
+        {"icon": "🟦", "name": "MS Work IQ", "url": "https://mcp.svc.cloud.microsoft/enterprise"},
+        {
+            "icon": "💼", "name": "Indeed", "url": "https://apis.indeed.com/mcp",
+            "oauth_auth_endpoint": "https://secure.indeed.com/oauth/v2/authorize",
+            "oauth_token_endpoint": "https://apis.indeed.com/oauth/v2/tokens",
+            "oauth_scope": "employer_access"
+        },
     ]
     
     cols = st.columns(3)
@@ -304,7 +312,25 @@ with st.sidebar:
                             sync_state()
                             st.rerun()
                     else:
-                        st.error(f"Failed to connect: {resp.json().get('detail', resp.text)}")
+                        detail = resp.json().get("detail", resp.text)
+                        needs_creds = any(kw in detail for kw in [
+                            "does not support auto-discovered OAuth",
+                            "credentials are missing",
+                            "CLIENT_ID",
+                            "dynamic client registration",
+                        ])
+                        if needs_creds:
+                            st.session_state.oauth_cred_prompt = {
+                                "name": s["name"],
+                                "url": s["url"],
+                                "oauth_auth_endpoint": s.get("oauth_auth_endpoint", ""),
+                                "oauth_token_endpoint": s.get("oauth_token_endpoint", ""),
+                                "oauth_scope": s.get("oauth_scope", ""),
+                                "source": "grid",
+                            }
+                            st.rerun()
+                        else:
+                            st.error(f"Failed to connect: {detail}")
                 except Exception as err:
                     st.error(f"Connection failed: {err}")
                     
@@ -316,6 +342,55 @@ with st.sidebar:
         st.link_button(f"⚡ Authorize with {pending['name']}", auth_url, use_container_width=True)
         if st.button("Cancel Connection Flow", key="cancel_oauth_grid", use_container_width=True):
             st.session_state.oauth_flow_pending = None
+            st.rerun()
+
+    # Render credential prompt when auto-discovery is not supported (e.g. Indeed)
+    if st.session_state.oauth_cred_prompt and st.session_state.oauth_cred_prompt.get("source") == "grid":
+        prompt = st.session_state.oauth_cred_prompt
+        st.warning(f"🔐 **{prompt['name']}** doesn't support auto-discovery. Enter your OAuth credentials below.")
+        cred_client_id = st.text_input("Client ID", key="cred_prompt_client_id", placeholder="e.g. abc123xyz")
+        cred_client_secret = st.text_input("Client Secret", key="cred_prompt_client_secret", type="password", placeholder="Your client secret")
+        if not prompt.get("oauth_auth_endpoint"):
+            cred_auth_ep = st.text_input("Auth Endpoint URL", key="cred_prompt_auth_ep", placeholder="https://...")
+            cred_token_ep = st.text_input("Token Endpoint URL", key="cred_prompt_token_ep", placeholder="https://...")
+            cred_scope = st.text_input("Scope (optional)", key="cred_prompt_scope", placeholder="e.g. read write")
+        else:
+            cred_auth_ep = prompt["oauth_auth_endpoint"]
+            cred_token_ep = prompt["oauth_token_endpoint"]
+            cred_scope = prompt["oauth_scope"]
+        col_ok, col_cancel = st.columns(2)
+        if col_ok.button("🔌 Connect", key="cred_prompt_submit", use_container_width=True):
+            if not cred_client_id.strip() or not cred_client_secret.strip():
+                st.error("Client ID and Client Secret are required.")
+            else:
+                with st.spinner(f"Connecting to {prompt['name']}..."):
+                    try:
+                        manual_payload = {
+                            "url": prompt["url"],
+                            "name": prompt["name"],
+                            "auth_option": "Manual OAuth2",
+                            "oauth_client_id": cred_client_id.strip(),
+                            "oauth_client_secret": cred_client_secret.strip(),
+                            "oauth_auth_endpoint": cred_auth_ep.strip(),
+                            "oauth_token_endpoint": cred_token_ep.strip(),
+                            "oauth_scope": cred_scope.strip(),
+                        }
+                        resp2 = httpx.post(f"{BACKEND_URL}/api/mcp/connect", json=manual_payload, timeout=20.0)
+                        if resp2.status_code == 200 and resp2.json().get("type") == "oauth":
+                            st.session_state.oauth_cred_prompt = None
+                            st.session_state.oauth_flow_pending = {
+                                "url": resp2.json()["auth_url"],
+                                "name": prompt["name"],
+                                "source": "grid",
+                            }
+                            st.toast(f"🔑 Redirecting to {prompt['name']} authorization page!")
+                            st.rerun()
+                        else:
+                            st.error(f"Failed: {resp2.json().get('detail', resp2.text)}")
+                    except Exception as ce:
+                        st.error(f"Connection failed: {ce}")
+        if col_cancel.button("Cancel", key="cred_prompt_cancel", use_container_width=True):
+            st.session_state.oauth_cred_prompt = None
             st.rerun()
 
     st.divider()

@@ -13,7 +13,7 @@ Fully replaces Redis + AsyncHybridCache using LangGraph's native memory:
 
 Public singletons (drop-in replacements for the old redis_cache.py exports):
     cache         — LangGraphMemoryManager  (same async API as AsyncHybridCache)
-    checkpointer  — MemorySaver instance    (passed to create_react_agent)
+    checkpointer  — MemorySaver instance    (passed to create_agent)
 
 Key differences from Redis version:
   - No network dependency, no connection pool, no reconnect logic.
@@ -58,7 +58,7 @@ class LangGraphMemoryManager:
 
     Uses two LangGraph primitives:
       - MemorySaver  : per-conversation checkpoint store (messages, tool calls,
-                       agent state) accessed via thread_id in create_react_agent.
+                       agent state) accessed via thread_id in create_agent.
       - InMemoryStore: flat K/V namespace store for sifter / tool-response /
                        embedding caches.
 
@@ -260,5 +260,5 @@ memory_manager = LangGraphMemoryManager()
 # `cache`        — drop-in for `from database.redis_cache import cache`
 cache = memory_manager
 
-# `checkpointer` — used by react_agent.py in create_react_agent(checkpointer=...)
+# `checkpointer` — used by react_agent.py in create_agent(checkpointer=...)
 checkpointer = memory_manager.checkpointer

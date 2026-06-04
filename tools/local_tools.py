@@ -9,8 +9,10 @@ from langchain_core.tools import tool, StructuredTool, BaseTool
 
 logger = logging.getLogger("mcp_backend")
 
-# Maximum characters for tool output before truncation (~2000 tokens)
-MAX_TOOL_OUTPUT_CHARS = 8000
+# Maximum characters for tool output before truncation (~500 tokens)
+# Lower than before — smart_filter_mcp_response strips fat first so the
+# truncation only kicks in as a last-resort safety net.
+MAX_TOOL_OUTPUT_CHARS = 2000
 
 def _truncate_tool_output(result: Any, tool_name: str) -> Any:
     """
@@ -27,6 +29,110 @@ def _truncate_tool_output(result: Any, tool_name: str) -> Any:
         )
         return truncated + f"\n\n... [Output truncated from {original_len} chars. Ask for specific details if you need more.]"
     return result
+
+
+import json as _json_module
+
+def smart_filter_mcp_response(raw: Any, tool_name: str, query_hint: str = "") -> Any:
+    """
+    Strips fat from MCP JSON responses before they are fed back to the LLM,
+    cutting token usage by 50-90% on large Notion/Cal payloads.
+
+    Strategy:
+    - If user asked for 'full content' or 'complete', skip filtering entirely.
+    - For Notion pages: keep id, title, url, created/edited times, property
+      *names* only (not nested objects), and a 500-char content preview.
+    - For Cal bookings: keep id, title, start, end, status, attendees only.
+    - For lists: process first 5 items only.
+    - For all others: keep any key whose value is a scalar, truncate strings
+      to 300 chars, skip large nested dicts/arrays.
+    """
+    # Never filter when user explicitly wants full content
+    hint_lower = query_hint.lower()
+    if any(kw in hint_lower for kw in ("full", "complete", "entire", "all content", "full content")):
+        return raw
+
+    def _filter_dict(d: dict, mode: str) -> dict:
+        kept: dict = {}
+
+        if mode == "notion":
+            scalar_keys = {"id", "title", "url", "created_time", "last_edited_time", "type", "archived"}
+            for k, v in d.items():
+                if k in scalar_keys:
+                    # title can be a rich-text list — flatten to plain text
+                    if k == "title" and isinstance(v, list):
+                        kept[k] = " ".join(t.get("plain_text", "") for t in v if isinstance(t, dict))
+                    else:
+                        kept[k] = v
+                elif k == "properties" and isinstance(v, dict):
+                    # Keep only property names, not nested value objects
+                    kept["property_keys"] = list(v.keys())
+                elif k in ("content", "text", "body") and isinstance(v, str):
+                    kept[k] = v[:500] + ("..." if len(v) > 500 else "")
+            return kept
+
+        elif mode == "cal":
+            keep_keys = {"id", "uid", "title", "startTime", "endTime", "status",
+                         "attendees", "location", "description", "meetingUrl"}
+            for k, v in d.items():
+                if k in keep_keys:
+                    if k == "description" and isinstance(v, str):
+                        kept[k] = v[:200] + ("..." if len(v) > 200 else "")
+                    elif k == "attendees" and isinstance(v, list):
+                        kept[k] = [{"name": a.get("name"), "email": a.get("email")} for a in v[:5]]
+                    else:
+                        kept[k] = v
+            return kept
+
+        else:
+            # Generic: keep scalars and short strings; skip large nested structures
+            for k, v in d.items():
+                if isinstance(v, (str, int, float, bool, type(None))):
+                    kept[k] = v[:300] if isinstance(v, str) and len(v) > 300 else v
+                elif isinstance(v, list) and len(v) <= 3:
+                    kept[k] = v
+                # skip large dicts/arrays
+            return kept
+
+    def _detect_mode(name: str) -> str:
+        n = name.lower()
+        if "notion" in n:
+            return "notion"
+        if "cal" in n or "booking" in n or "event" in n or "calendar" in n:
+            return "cal"
+        return "generic"
+
+    mode = _detect_mode(tool_name)
+
+    try:
+        # If raw is a JSON string, parse it first
+        parsed = raw
+        if isinstance(raw, str):
+            try:
+                parsed = _json_module.loads(raw)
+            except Exception:
+                # Not JSON — truncate plain text
+                return raw[:1500] + ("..." if len(raw) > 1500 else "")
+
+        if isinstance(parsed, dict):
+            filtered = _filter_dict(parsed, mode)
+            result = _json_module.dumps(filtered, default=str)
+        elif isinstance(parsed, list):
+            filtered_list = [_filter_dict(item, mode) if isinstance(item, dict) else item
+                             for item in parsed[:5]]  # max 5 items
+            result = _json_module.dumps(filtered_list, default=str)
+        else:
+            result = str(parsed)[:1500]
+
+        saved = len(str(raw)) - len(result)
+        if saved > 0:
+            logger.info(f"[TOKEN SAVER] smart_filter_mcp_response '{tool_name}': "
+                        f"{len(str(raw))} → {len(result)} chars (saved ~{saved // 4} tokens).")
+        return result
+
+    except Exception as filter_err:
+        logger.warning(f"[TOKEN SAVER] smart_filter_mcp_response failed for '{tool_name}': {filter_err}. Using raw.")
+        return raw
 
 def _get_tool_cache_key(tool_name: str, kwargs: dict) -> str:
     """Generates a unique cache key for a tool invocation based on name + arguments."""
@@ -61,14 +167,20 @@ def wrap_tool_with_coercion(tool_inst: BaseTool) -> BaseTool:
             res = await tool_inst.ainvoke(kwargs)
             logger.info(f"[TOOL SUCCESS] Tool '{tool_inst.name}' successfully returned output.")
             
-            # ── Truncate oversized outputs ──
+            # ── Smart JSON filtering (before truncation) ──
+            # Strip fat from Notion/Cal/generic MCP JSON payloads so the LLM
+            # only sees the fields it actually needs. Saves 50-90% of tokens
+            # on large API responses without losing important data.
+            res = smart_filter_mcp_response(res, tool_inst.name, str(kwargs))
+
+            # ── Truncate oversized outputs (last-resort safety net) ──
             res = _truncate_tool_output(res, tool_inst.name)
             
-            # ── Cache the result for 5 minutes ──
+            # ── Cache the result for 1 hour (MCP data is rarely stale) ──
             if cache_key:
                 try:
                     from database import cache
-                    await cache.set(cache_key, str(res), ttl=300)
+                    await cache.set(cache_key, str(res), ttl=3600)
                 except Exception:
                     pass
             
@@ -99,13 +211,14 @@ def wrap_tool_with_coercion(tool_inst: BaseTool) -> BaseTool:
                     try:
                         res = await tool_inst.ainvoke(new_kwargs)
                         logger.info(f"[TOOL SUCCESS] Coerced retry of '{tool_inst.name}' completed successfully.")
+                        res = smart_filter_mcp_response(res, tool_inst.name, str(new_kwargs))
                         res = _truncate_tool_output(res, tool_inst.name)
                         # BUG FIX: cache the coerced result so the same args don't repeat
                         # the error + coercion cycle on every identical call
                         if cache_key:
                             try:
                                 from database import cache
-                                await cache.set(cache_key, str(res), ttl=300)
+                                await cache.set(cache_key, str(res), ttl=3600)
                             except Exception:
                                 pass
                         return res

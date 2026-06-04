@@ -6,7 +6,7 @@ Integrates dynamic MCP clients, binds local search/workspace helper tools,
 and coordinates pre-execution strategic planners.
 
 Memory strategy (post-Redis migration):
-  - LangGraph MemorySaver is passed as `checkpointer` to create_react_agent.
+  - LangGraph MemorySaver is passed as `checkpointer` to create_agent.
   - Each conversation is identified by a `thread_id`; LangGraph manages the
     full message state per thread automatically.
   - On the FIRST call for a thread the caller provides prior `history` to seed
@@ -26,10 +26,10 @@ import re
 from typing import Dict, Any, List, AsyncGenerator
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
-from config import get_llm, UPLOAD_DIR, _make_cfg
+from config import get_llm, get_cheap_llm, UPLOAD_DIR, _make_cfg
 from database import cache, checkpointer
 from database.langgraph_memory import KEY_SIFTER, TTL_SIFTER
 from prompts import build_system_prompt
@@ -53,18 +53,171 @@ logger = logging.getLogger("mcp_backend")
 _INITIALIZED_THREADS: set = set()
 
 
+# ── Dynamic prompt helpers ─────────────────────────────────────────────────────
+
+def _infer_server_capabilities(tool_names: List[str]) -> List[str]:
+    """
+    Maps raw MCP tool names to human-readable capability labels so the sifter
+    and planner prompts describe what each server can *do* rather than listing
+    opaque tool identifiers.
+    """
+    caps = set()
+    name_blob = " ".join(tool_names).lower()
+    rules = [
+        (["create", "add", "insert", "new"],             "create records"),
+        (["update", "edit", "patch", "modify"],          "update records"),
+        (["delete", "remove", "archive"],                 "delete records"),
+        (["list", "get", "fetch", "query", "search",
+          "find", "retrieve"],                            "search & retrieve"),
+        (["send", "email", "message", "notify"],          "send messages"),
+        (["upload", "attach", "file"],                    "file handling"),
+        (["schedule", "event", "calendar", "meeting"],    "calendar / scheduling"),
+        (["summarize", "summarise", "analyse", "analyze",
+          "extract"],                                     "AI summarisation"),
+    ]
+    for keywords, label in rules:
+        if any(kw in name_blob for kw in keywords):
+            caps.add(label)
+    return sorted(caps) if caps else ["general actions"]
+
+
+def _extract_recent_topics(history: List[Dict[str, str]], n: int = 4) -> str:
+    """
+    Returns a compact one-line summary of the last *n* user messages so the
+    sifter can factor in recent conversation context without blowing the prompt.
+    """
+    recent = [m.get("content", "") for m in history if m.get("role") == "user"][-n:]
+    if not recent:
+        return "none"
+    joined = " | ".join(t[:80] for t in recent)
+    return joined if len(joined) <= 300 else joined[:297] + "..."
+
+
+def build_dynamic_sifter_prompt(
+    prompt: str,
+    all_mcp_tools: Dict[str, list],
+    history: List[Dict[str, str]],
+) -> str:
+    """
+    Builds a fully context-aware classification prompt that reflects exactly
+    which servers are connected and what they can do, plus recent conversation
+    topics to avoid misclassifying follow-up queries.
+    """
+    action_group_lines = []
+    for server_name, tools in all_mcp_tools.items():
+        tool_names = [getattr(t, "name", "") for t in tools]
+        caps = _infer_server_capabilities(tool_names)
+        sample = ", ".join(tool_names[:6]) + (", ..." if len(tool_names) > 6 else "")
+        action_group_lines.append(
+            f"- '{server_name}': {', '.join(caps)}  (tools: {sample})"
+        )
+    action_group_lines.append(
+        "- 'Local': web search, web scraping, local file reading, docs search"
+    )
+    action_groups_text = "\n".join(action_group_lines)
+    recent_topics = _extract_recent_topics(history)
+
+    return (
+        "You are a query router for an AI assistant. Classify the user query and "
+        "decide which tool groups are needed to answer it.\n\n"
+        "## Available action groups\n"
+        f"{action_groups_text}\n\n"
+        "## Recent conversation context\n"
+        f"{recent_topics}\n\n"
+        "## Classification rules\n"
+        "1. 'CONVERSATIONAL' - greetings, small talk, questions about the assistant's "
+        "own capabilities. Use NO tool groups.\n"
+        "2. 'DIRECT_TOOL' - single-step requests that need exactly one server or one "
+        "tool call (e.g. 'list my Notion pages', 'search for X'). Pick the most "
+        "relevant group(s).\n"
+        "3. 'COMPLEX' - multi-step workflows requiring coordination across multiple "
+        "tools or servers. List all needed groups.\n\n"
+        "## Real-time data rule (MANDATORY)\n"
+        "If the query asks for information that changes over time - current events, "
+        "today's news, live prices, latest software versions, weather, recent "
+        "announcements, or contains words like 'current', 'latest', 'today', 'now', "
+        "'recent', 'right now', 'live', 'breaking' - you MUST:\n"
+        "  a) include 'Local' in tool_groups (for web search)\n"
+        "  b) NOT classify as CONVERSATIONAL\n\n"
+        f"## User query\n\"{prompt}\"\n\n"
+        "Output ONLY a raw JSON object - no markdown, no explanation:\n"
+        "{\"category\": \"CONVERSATIONAL|DIRECT_TOOL|COMPLEX\", \"tool_groups\": [...]}"
+    )
+
+
+def build_dynamic_planner_prompt(
+    query: str,
+    state: Dict[str, Any],
+    all_mcp_tools: Dict[str, list],
+) -> str:
+    """
+    Builds a planner system prompt that lists ONLY the servers that are actually
+    connected (with live tool counts) so the agent never references a service
+    the user hasn't set up.
+
+    Output is a JSON array of ordered steps — each step names the exact tool
+    so the agent executes them in strict sequence without guessing the order.
+    """
+    server_lines = []
+    for name in state.get("mcp_servers", {}):
+        tool_count = len(all_mcp_tools.get(name, []))
+        tool_names = [getattr(t, "name", "") for t in all_mcp_tools.get(name, [])]
+        sample = ", ".join(tool_names[:5]) + (", ..." if len(tool_names) > 5 else "")
+        server_lines.append(f"- {name} ({tool_count} tools: {sample})")
+    server_lines.append(
+        "- Local tools: web_search, web_scrape, read_uploaded_file, "
+        "prepare_file_for_upload, query_documentation"
+    )
+    servers_text = "\n".join(server_lines)
+
+    return (
+        "You are the Strategic Planning Engine for an AI assistant.\n\n"
+        "## Active servers and tools\n"
+        f"{servers_text}\n\n"
+        "## Your task\n"
+        f"Generate a precise, ordered execution plan to fulfil: \"{query}\"\n\n"
+        "## Output format — MANDATORY\n"
+        "Output ONLY a raw JSON array — no markdown, no explanation:\n"
+        "[\n"
+        "  {\"step\": 1, \"tool\": \"<exact_tool_name>\", \"purpose\": \"<one sentence>\"},\n"
+        "  {\"step\": 2, \"tool\": \"<exact_tool_name>\", \"purpose\": \"<one sentence>\"}\n"
+        "]\n\n"
+        "## Rules\n"
+        "- Use ONLY tool names from the list above — never invent tools.\n"
+        "- Steps MUST be in logical execution order (e.g. search before scrape, "
+        "fetch data before create).\n"
+        "- If web search is needed, use tool name 'web_search'.\n"
+        "- Do NOT execute any tools — output the plan only."
+    )
+
+
+def _parse_structured_plan(raw: str) -> list:
+    """
+    Parses the planner's JSON output into a list of step dicts.
+    Falls back to a single-step list if parsing fails so the agent
+    always gets something actionable.
+    """
+    try:
+        cleaned = re.sub(r"```json\s*|\s*```", "", raw.strip()).strip()
+        steps = json.loads(cleaned)
+        if isinstance(steps, list) and steps:
+            return steps
+    except Exception:
+        pass
+    return [{"step": 1, "tool": "auto", "purpose": raw.strip() or "Process request using available tools."}]
+
+
 async def compress_history_sandwich(
     history: List[Dict[str, str]],
-    llm_inst
+    llm_inst,
+    cheap_llm_inst=None,
 ) -> List[Dict[str, str]]:
     """
-    Compresses chat history for the initial thread seed:
-      - Prunes trivial noise messages.
-      - If <= 8 messages, returns as-is.
-      - Otherwise keeps first 3 + last 3 and summarises the middle via LLM.
-        The summary is cached in LangGraph InMemoryStore (1 h TTL) so repeat
-        sessions with the same middle slice skip the LLM round-trip.
+    Compresses chat history for the initial thread seed.
+    Uses cheap_llm_inst (if provided) for tone detection + summarisation
+    to avoid burning primary-model tokens on internal bookkeeping.
     """
+    _summariser = cheap_llm_inst if cheap_llm_inst is not None else llm_inst
     noise_patterns = [
         r"^(hi|hello|hey|greetings|howdy|ok|ok bro|thanks|thank you|ok thanks|cool)$"
     ]
@@ -95,15 +248,40 @@ async def compress_history_sandwich(
         logger.info(f"[HISTORY COMPRESS] Summary cache hit (hash={middle_hash})")
         summary_paragraph = cached_summary
     else:
-        logger.info("[HISTORY COMPRESS] Summarising middle slice via LLM...")
+        logger.info("[HISTORY COMPRESS] Detecting conversation tone...")
+        tone_map = {
+            "technical":  "Use precise technical terminology; preserve tool names, "
+                          "IDs, and specific details.",
+            "casual":     "Use relaxed, plain language; focus on the key points only.",
+            "formal":     "Use professional, concise language; avoid contractions.",
+        }
+        try:
+            tone_res = await _summariser.ainvoke([SystemMessage(
+                content=(
+                    "Classify the tone of the following conversation as exactly one of: "
+                    "'technical', 'casual', or 'formal'. "
+                    "Reply with ONLY that single word.\n\n"
+                    f"--- Conversation ---\n{middle_text}"
+                )
+            )])
+            detected_tone = (tone_res.content if hasattr(tone_res, "content") else "casual").strip().lower()
+            if detected_tone not in tone_map:
+                detected_tone = "casual"
+        except Exception:
+            detected_tone = "casual"
+
+        style_instruction = tone_map[detected_tone]
+        logger.info(f"[HISTORY COMPRESS] Detected tone: {detected_tone}. Summarising...")
         summary_prompt = (
-            "Generate a brief, high-level summary of the following conversation segment, "
-            "highlighting key questions, decisions, and actions. "
-            "One dense paragraph only.\n\n"
+            f"Summarise the following conversation segment in one dense paragraph. "
+            f"{style_instruction} "
+            "Highlight key questions, decisions, actions, and any important data "
+            "(names, IDs, URLs, amounts). Do not omit facts that a future assistant "
+            "turn might need.\n\n"
             f"--- Conversation ---\n{middle_text}"
         )
         try:
-            res = await llm_inst.ainvoke([SystemMessage(content=summary_prompt)])
+            res = await _summariser.ainvoke([SystemMessage(content=summary_prompt)])
             summary_paragraph = res.content if hasattr(res, "content") else str(res)
             await cache.set_history_summary(middle_hash, summary_paragraph.strip())
         except Exception as e:
@@ -143,7 +321,8 @@ async def stream_agent_interaction(
 
     # Always compute compressed_history so the planning phase can reference it
     # regardless of whether this is a new or existing thread.
-    compressed_history = await compress_history_sandwich(history, llm_inst)
+    cheap_llm = get_cheap_llm()
+    compressed_history = await compress_history_sandwich(history, llm_inst, cheap_llm_inst=cheap_llm)
 
     if is_new_thread:
         # First time: seed the checkpoint with compressed prior context
@@ -213,7 +392,20 @@ async def stream_agent_interaction(
     tool_groups = []
     plan_text   = ""
 
-    try:
+    # ── Fast-path: skip sifter entirely for obvious trivial queries ───────────
+    _TRIVIAL_PHRASES = {
+        "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "ok thanks",
+        "ok bro", "cool", "got it", "sounds good", "great", "perfect", "bye",
+        "goodbye", "see you", "see ya",
+    }
+    _prompt_stripped = prompt.strip().lower().rstrip("!.,?")
+    if len(prompt.split()) <= 3 and _prompt_stripped in _TRIVIAL_PHRASES:
+        needs_plan = needs_tools = False
+        tool_groups = []
+        plan_text = "Pure conversational small talk."
+        logger.info(f"[PLANNER] Trivial query fast-path — skipping sifter LLM call.")
+    else:
+      try:
         server_descriptions = ""
         for name, mcp_tools in all_mcp_tools.items():
             tool_names    = [getattr(t, "name", "") for t in mcp_tools]
@@ -226,17 +418,7 @@ async def stream_agent_interaction(
             if srv_name not in all_mcp_tools:
                 server_descriptions += f"- '{srv_name}': Connected server (tools loading).\n"
 
-        classification_prompt = (
-            "Analyze the following user query and conversation history, and classify it:\n\n"
-            "1. 'CONVERSATIONAL': Greetings, small talk, general info, capabilities.\n"
-            "2. 'DIRECT_TOOL': Single-step tool requests (list companies, search files, etc).\n"
-            "3. 'COMPLEX': Multi-step workflows needing sequential tool coordination.\n\n"
-            "Also identify required tool groups from:\n"
-            f"{server_descriptions}"
-            "- 'Local': files, docs, web search, web scraping.\n\n"
-            f"User Query: \"{prompt}\"\n\n"
-            "Output ONLY a raw JSON block: {\"category\": \"...\", \"tool_groups\": [...]}"
-        )
+        classification_prompt = build_dynamic_sifter_prompt(prompt, all_mcp_tools, history)
 
         sifter_hash = hashlib.sha256(
             f"{prompt.lower().strip()}:{server_descriptions}".encode()
@@ -248,7 +430,7 @@ async def stream_agent_interaction(
             tool_groups = cached_sifter.get("tool_groups", [])
             logger.info(f"[PLANNER] Sifter cache hit: {category} | {tool_groups}")
         else:
-            class_res = await llm_inst.ainvoke([SystemMessage(content=classification_prompt)])
+            class_res = await cheap_llm.ainvoke([SystemMessage(content=classification_prompt)])
             if getattr(class_res, "usage_metadata", None):
                 total_input_tokens  += class_res.usage_metadata.get("input_tokens", 0)
                 total_output_tokens += class_res.usage_metadata.get("output_tokens", 0)
@@ -268,6 +450,24 @@ async def stream_agent_interaction(
 
             logger.info(f"[PLANNER] Sifter decision: {category} | {tool_groups}")
 
+        # ── Hard override: force 'Local' (web search) for any real-time query ──
+        # This runs after both cache-hit and fresh classification so it can never
+        # be bypassed by a stale cached sifter result.
+        _REALTIME_KEYWORDS = {
+            "current", "currently", "today", "now", "latest", "recent", "recently",
+            "right now", "live", "breaking", "this week", "this month", "this year",
+            "2024", "2025", "2026", "news", "price", "stock", "weather", "update",
+        }
+        _prompt_tokens = set(prompt.lower().replace("?", "").replace(",", "").split())
+        if _prompt_tokens & _REALTIME_KEYWORDS:
+            if "Local" not in tool_groups:
+                tool_groups.append("Local")
+            # Conversational classification is wrong for real-time queries —
+            # upgrade to DIRECT_TOOL so the web search tool actually gets loaded.
+            if "CONVERSATIONAL" in category:
+                category = "DIRECT_TOOL"
+            logger.info(f"[PLANNER] Real-time keyword override applied → {category} | {tool_groups}")
+
         if "CONVERSATIONAL" in category:
             needs_plan = needs_tools = False
             plan_text = "Pure conversational small talk."
@@ -278,7 +478,24 @@ async def stream_agent_interaction(
         else:
             needs_plan = needs_tools = True
 
-    except Exception as sifter_err:
+        # ── Ambiguity detection: multiple MCP servers matched + vague query ──
+        # If the sifter picked 2+ non-Local tool groups and the query contains
+        # no explicit service name, ask the user to clarify rather than
+        # silently guessing the wrong source.
+        _mcp_groups = [g for g in tool_groups if g != "Local"]
+        if len(_mcp_groups) > 1 and "CONVERSATIONAL" not in category:
+            _explicit_mentions = [g for g in _mcp_groups if g.lower() in prompt.lower()]
+            if not _explicit_mentions:
+                service_list = ", ".join(_mcp_groups)
+                clarify_msg = (
+                    f"I found multiple services that could answer this — {service_list}. "
+                    "Which one should I use?"
+                )
+                logger.info(f"[PLANNER] Ambiguous query — clarification needed: {_mcp_groups}")
+                yield f"event: clarification\ndata: {json.dumps({'text': clarify_msg, 'options': _mcp_groups})}\n\n"
+                return
+
+      except Exception as sifter_err:
         logger.error(f"[PLANNER ERROR] Sifter failed: {sifter_err}")
         needs_plan = needs_tools = True
         tool_groups = list(state.get("mcp_servers", {}).keys()) + ["Local"]
@@ -337,18 +554,12 @@ async def stream_agent_interaction(
     # ── 4. Strategic Planning Phase ───────────────────────────────────────────
     if needs_plan:
         logger.info("[PLANNER] Running pre-execution strategic planning...")
-        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Creating strategic execution plan...'})}"
+        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Creating strategic execution plan...'})}\n\n"
 
         try:
-            planning_system_prompt = (
-                "You are the Strategic Planning Engine for an advanced multi-tool AI assistant.\n"
-                "Analyse the user's request and generate a precise step-by-step TODO list showing "
-                "how to solve it using available tools (HubSpot CRM, Zoho CRM, Notion, Cal.com, "
-                "Google Drive, Gmail, web search/scrape, local files, docs search).\n"
-                "Do NOT call tools yet — just outline the strategy. Keep it structured."
-            )
+            planning_system_prompt = build_dynamic_planner_prompt(prompt, state, all_mcp_tools)
             planning_msgs = [SystemMessage(content=planning_system_prompt)]
-            for h in (compressed_history if is_new_thread else history[-6:]):
+            for h in (compressed_history if is_new_thread else history[-3:]):
                 r = h.get("role"); c = h.get("content", "")
                 if r == "user":      planning_msgs.append(HumanMessage(content=c))
                 elif r == "assistant": planning_msgs.append(AIMessage(content=c))
@@ -356,29 +567,49 @@ async def stream_agent_interaction(
                 content=f"Generate a strategic execution plan (TODO list) for: '{prompt}'"
             ))
 
-            plan_response = await llm_inst.ainvoke(planning_msgs)
+            plan_response = await cheap_llm.ainvoke(planning_msgs)
             if getattr(plan_response, "usage_metadata", None):
                 total_input_tokens  += plan_response.usage_metadata.get("input_tokens", 0)
                 total_output_tokens += plan_response.usage_metadata.get("output_tokens", 0)
 
-            plan_text = plan_response.content if hasattr(plan_response, "content") else str(plan_response)
-            yield f"event: thought\ndata: {json.dumps({'text': f'📋 **Strategic Plan**:{plan_text}'})}"
+            raw_plan  = plan_response.content if hasattr(plan_response, "content") else str(plan_response)
+            plan_steps = _parse_structured_plan(raw_plan)
+
+            # Convert structured steps back into readable text for the system prompt
+            plan_text = "\n".join(
+                f"Step {s.get('step', i+1)}: [{s.get('tool','auto')}] {s.get('purpose','')}"
+                for i, s in enumerate(plan_steps)
+            )
+
+            # Show a clean numbered list in the UI thought panel
+            display_plan = "\n".join(
+                f"{s.get('step', i+1)}. {s.get('purpose','')} → `{s.get('tool','auto')}`"
+                for i, s in enumerate(plan_steps)
+            )
+            yield f"event: thought\ndata: {json.dumps({'text': f'📋 **Execution Plan:**\n{display_plan}'})}\n\n"
         except Exception as plan_err:
             logger.error(f"[PLANNER ERROR] {plan_err}")
             plan_text = "Step 1: Directly process request using available tools."
 
     # ── 5. Build system prompt ─────────────────────────────────────────────────
     base_prompt = build_system_prompt(state, active_groups=tool_groups)
+    _search_instruction = (
+        "After calling web_search or web_scrape, always present the results as a "
+        "concise, readable summary — highlight key facts, dates, and names. "
+        "Never dump raw snippets or URLs as the final answer.\n\n"
+    )
     if needs_plan:
         system_prompt = (
             f"{base_prompt}\n\n"
-            f"### STRATEGIC PLAN TO FOLLOW:\n{plan_text}\n\n"
+            f"{_search_instruction}"
+            f"### STRATEGIC PLAN TO FOLLOW (execute steps in this exact order):\n{plan_text}\n\n"
             "Use your tools as dictated by the plan. When scraping websites, extract details "
             "via LLM context—do not use regex. Enrich CRM with discovered data."
         )
     elif needs_tools:
         system_prompt = (
             f"{base_prompt}\n\n"
+            f"{_search_instruction}"
             "Respond directly or execute required tools immediately. "
             "If tools are needed, call them. Otherwise give a clear direct response."
         )
@@ -391,14 +622,14 @@ async def stream_agent_interaction(
     # ── 6. Execute agent with LangGraph MemorySaver ───────────────────────────
     logger.info(f"[AGENT] Streaming with thread_id='{thread_id}', tools={len(tools)}")
     if needs_plan:
-        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Executing plan with dynamic tools...'})}"
+        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Executing plan with dynamic tools...'})}\n\n"
 
     thread_config = {"configurable": {"thread_id": thread_id}}
 
     try:
         if tools:
             # MemorySaver passed as checkpointer — LangGraph handles history per thread_id
-            agent = create_react_agent(
+            agent = create_agent(
                 llm_inst,
                 tools,
                 prompt=system_prompt,
@@ -414,15 +645,15 @@ async def stream_agent_interaction(
                         if getattr(msg, "tool_calls", None):
                             for tc in msg.tool_calls:
                                 logger.info(f"[AGENT THOUGHT] Tool call: {tc['name']}")
-                                yield f"event: tool_call\ndata: {json.dumps({'name': tc['name'], 'args': tc['args']})}"
+                                yield f"event: tool_call\ndata: {json.dumps({'name': tc['name'], 'args': tc['args']})}\n\n"
 
                         if hasattr(msg, "content") and msg.content:
-                            yield f"event: content\ndata: {json.dumps({'text': msg.content})}"
+                            yield f"event: content\ndata: {json.dumps({'text': msg.content})}\n\n"
 
                 elif "tools" in chunk:
                     for msg in chunk["tools"]["messages"]:
                         logger.info(f"[TOOL RESPONSE] {msg.name}")
-                        yield f"event: tool_output\ndata: {json.dumps({'name': msg.name, 'content': str(msg.content)})}"
+                        yield f"event: tool_output\ndata: {json.dumps({'name': msg.name, 'content': str(msg.content)})}\n\n"
         else:
             # Conversational path — no tools, no checkpointer needed
             logger.info("[CHAT] No tools. Streaming direct LLM response...")
@@ -433,14 +664,14 @@ async def stream_agent_interaction(
             async for token_chunk in llm_inst.astream(full_msgs):
                 if token_chunk.content:
                     full_response += token_chunk.content
-                    yield f"event: content\ndata: {json.dumps({'text': token_chunk.content})}"
+                    yield f"event: content\ndata: {json.dumps({'text': token_chunk.content})}\n\n"
             total_output_tokens += count_tokens(full_response)
 
-        yield f"event: token_usage\ndata: {json.dumps({'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens})}"
-        yield f"event: thought\ndata: {json.dumps({'text': '✅ Completed successfully'})}"
+        yield f"event: token_usage\ndata: {json.dumps({'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens})}\n\n"
+        yield f"event: thought\ndata: {json.dumps({'text': '✅ Completed successfully'})}\n\n"
 
     except Exception as e:
         logger.error(f"[CHAT ERROR] {e}", exc_info=True)
         from routes.state_routes import unpack_exception
         clean_msg = unpack_exception(e)
-        yield f"event: error\ndata: {json.dumps({'message': clean_msg})}"
+        yield f"event: error\ndata: {json.dumps({'message': clean_msg})}\n\n"

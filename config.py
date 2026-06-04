@@ -59,6 +59,31 @@ def get_llm() -> AzureChatOpenAI:
         streaming=True,
     )
 
+
+def get_cheap_llm() -> AzureChatOpenAI:
+    """
+    Returns a cheaper, non-streaming LLM instance for lightweight classification
+    tasks (sifter, planner, history tone detection) that don't need the full
+    primary model.
+
+    Falls back to the primary deployment if AZURE_OPENAI_CHEAP_DEPLOYMENT is
+    not set — still saves cost by disabling streaming on these short calls.
+    """
+    cheap_deployment = (
+        os.getenv("AZURE_OPENAI_CHEAP_DEPLOYMENT") or
+        os.getenv("AZURE_OPENAI_DEPLOYMENT") or
+        os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or
+        "gpt-4.1-mini"
+    )
+    return AzureChatOpenAI(
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
+        azure_deployment=cheap_deployment,
+        streaming=False,   # no streaming needed for classification/planning
+        max_tokens=512,    # sifter/planner outputs are always short
+    )
+
 from typing import Dict, Any
 
 def _make_cfg(url: str, auth_type: str, auth_value: str, transport: str = "streamable_http") -> Dict[str, Any]:

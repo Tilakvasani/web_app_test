@@ -9,10 +9,10 @@ from langchain_core.tools import tool, StructuredTool, BaseTool
 
 logger = logging.getLogger("mcp_backend")
 
-# Maximum characters for tool output before truncation (~500 tokens)
-# Lower than before — smart_filter_mcp_response strips fat first so the
-# truncation only kicks in as a last-resort safety net.
-MAX_TOOL_OUTPUT_CHARS = 2000
+# Maximum characters for tool output before truncation.
+# Increased from 2000 → 6000 so the agent sees enough items per call
+# and doesn't loop trying to paginate more results.
+MAX_TOOL_OUTPUT_CHARS = 6000
 
 def _truncate_tool_output(result: Any, tool_name: str) -> Any:
     """
@@ -27,7 +27,7 @@ def _truncate_tool_output(result: Any, tool_name: str) -> Any:
             f"[TOKEN SAVER] Tool '{tool_name}' output truncated from {original_len} to {MAX_TOOL_OUTPUT_CHARS} chars "
             f"(saved ~{(original_len - MAX_TOOL_OUTPUT_CHARS) // 4} tokens)."
         )
-        return truncated + f"\n\n... [Output truncated from {original_len} chars. Ask for specific details if you need more.]"
+        return truncated + f"\n\n... [Output truncated. You now have enough data — proceed to the next step rather than calling this tool again.]"
     return result
 
 
@@ -35,22 +35,43 @@ import json as _json_module
 
 def smart_filter_mcp_response(raw: Any, tool_name: str, query_hint: str = "") -> Any:
     """
-    Strips fat from MCP JSON responses before they are fed back to the LLM,
-    cutting token usage by 50-90% on large Notion/Cal payloads.
+    Strips fat from MCP JSON responses before they are fed back to the LLM.
 
-    Strategy:
-    - If user asked for 'full content' or 'complete', skip filtering entirely.
-    - For Notion pages: keep id, title, url, created/edited times, property
-      *names* only (not nested objects), and a 500-char content preview.
-    - For Cal bookings: keep id, title, start, end, status, attendees only.
-    - For lists: process first 5 items only.
-    - For all others: keep any key whose value is a scalar, truncate strings
-      to 300 chars, skip large nested dicts/arrays.
+    Key rules:
+    - MCP content blocks  ([{"type":"text","text":"..."}])  are NEVER filtered —
+      their text is extracted and returned verbatim (up to MAX_TOOL_OUTPUT_CHARS).
+      Filtering them was the root cause of get_jobs returning only 483 chars.
+    - Notion payloads get field-level filtering (keep id/title/url only).
+    - Calendar payloads keep only scheduling-relevant keys.
+    - All other dicts: keep scalars, truncate long strings to 2000 chars (was 300).
+    - Lists: process first 10 items.
     """
-    # Never filter when user explicitly wants full content
     hint_lower = query_hint.lower()
     if any(kw in hint_lower for kw in ("full", "complete", "entire", "all content", "full content")):
         return raw
+
+    # ── MCP content-block detection ────────────────────────────────────────────
+    # MCP tools often return  [{"type": "text", "text": "<all the data>", "id": "..."}]
+    # or  {"type": "text", "text": "..."}  (single block).
+    # Filtering these with the generic dict filter truncates `text` to 300 chars —
+    # destroying the payload.  Instead, extract the text and return it directly.
+    def _is_mcp_content_block(obj) -> bool:
+        """True if obj looks like an MCP content block or list of blocks."""
+        if isinstance(obj, dict):
+            return obj.get("type") in ("text", "tool_result", "image") and "text" in obj
+        if isinstance(obj, list) and obj:
+            return all(
+                isinstance(item, dict) and item.get("type") in ("text", "tool_result", "image")
+                for item in obj
+            )
+        return False
+
+    def _extract_mcp_text(obj) -> str:
+        if isinstance(obj, dict):
+            return obj.get("text", str(obj))
+        if isinstance(obj, list):
+            return "\n".join(item.get("text", str(item)) for item in obj if isinstance(item, dict))
+        return str(obj)
 
     def _filter_dict(d: dict, mode: str) -> dict:
         kept: dict = {}
@@ -59,13 +80,11 @@ def smart_filter_mcp_response(raw: Any, tool_name: str, query_hint: str = "") ->
             scalar_keys = {"id", "title", "url", "created_time", "last_edited_time", "type", "archived"}
             for k, v in d.items():
                 if k in scalar_keys:
-                    # title can be a rich-text list — flatten to plain text
                     if k == "title" and isinstance(v, list):
                         kept[k] = " ".join(t.get("plain_text", "") for t in v if isinstance(t, dict))
                     else:
                         kept[k] = v
                 elif k == "properties" and isinstance(v, dict):
-                    # Keep only property names, not nested value objects
                     kept["property_keys"] = list(v.keys())
                 elif k in ("content", "text", "body") and isinstance(v, str):
                     kept[k] = v[:500] + ("..." if len(v) > 500 else "")
@@ -85,13 +104,13 @@ def smart_filter_mcp_response(raw: Any, tool_name: str, query_hint: str = "") ->
             return kept
 
         else:
-            # Generic: keep scalars and short strings; skip large nested structures
+            # Generic: keep scalars + short lists.
+            # String cap raised from 300 → 2000 so job/search text is not destroyed.
             for k, v in d.items():
                 if isinstance(v, (str, int, float, bool, type(None))):
-                    kept[k] = v[:300] if isinstance(v, str) and len(v) > 300 else v
-                elif isinstance(v, list) and len(v) <= 3:
+                    kept[k] = v[:2000] if isinstance(v, str) and len(v) > 2000 else v
+                elif isinstance(v, list) and len(v) <= 5:
                     kept[k] = v
-                # skip large dicts/arrays
             return kept
 
     def _detect_mode(name: str) -> str:
@@ -105,24 +124,32 @@ def smart_filter_mcp_response(raw: Any, tool_name: str, query_hint: str = "") ->
     mode = _detect_mode(tool_name)
 
     try:
-        # If raw is a JSON string, parse it first
         parsed = raw
         if isinstance(raw, str):
             try:
                 parsed = _json_module.loads(raw)
             except Exception:
-                # Not JSON — truncate plain text
-                return raw[:1500] + ("..." if len(raw) > 1500 else "")
+                # Plain text — return as-is up to a reasonable limit
+                return raw[:MAX_TOOL_OUTPUT_CHARS] + ("..." if len(raw) > MAX_TOOL_OUTPUT_CHARS else "")
+
+        # ── MCP content blocks: skip filtering, return text directly ──────────
+        if _is_mcp_content_block(parsed):
+            text = _extract_mcp_text(parsed)
+            logger.info(
+                f"[TOKEN SAVER] '{tool_name}' response is MCP content block(s) — "
+                f"skipping dict filter, preserving {len(text)} chars of text."
+            )
+            return text  # _truncate_tool_output will cap this at MAX_TOOL_OUTPUT_CHARS
 
         if isinstance(parsed, dict):
             filtered = _filter_dict(parsed, mode)
             result = _json_module.dumps(filtered, default=str)
         elif isinstance(parsed, list):
             filtered_list = [_filter_dict(item, mode) if isinstance(item, dict) else item
-                             for item in parsed[:5]]  # max 5 items
+                             for item in parsed[:10]]
             result = _json_module.dumps(filtered_list, default=str)
         else:
-            result = str(parsed)[:1500]
+            result = str(parsed)[:MAX_TOOL_OUTPUT_CHARS]
 
         saved = len(str(raw)) - len(result)
         if saved > 0:
@@ -138,21 +165,38 @@ def _get_tool_cache_key(tool_name: str, kwargs: dict) -> str:
     """Generates a unique cache key for a tool invocation based on name + arguments."""
     args_str = str(sorted(kwargs.items()))
     args_hash = hashlib.sha256(args_str.encode("utf-8")).hexdigest()[:32]
-    # BUG FIX: use "mcp:tool_resp:*" prefix to match KEY_TOOL_RESPONSE constant in
-    # redis_cache.py so cache_stats() counts them and invalidate_tool_cache() clears them
     return f"mcp:tool_resp:{tool_name}:{args_hash}"
 
-def wrap_tool_with_coercion(tool_inst: BaseTool) -> BaseTool:
+def wrap_tool_with_coercion(tool_inst: BaseTool, call_counter: Dict[str, int] = None) -> BaseTool:
     """
-    Wraps an MCP tool to intercept datatype mismatches (e.g., string instead of int)
-    and coerce parameters automatically. Also applies:
-    - Tool output truncation to cap token costs on massive API responses.
-    - Redis response caching so repeated identical calls load instantly for 0 tokens.
+    Wraps an MCP tool to intercept datatype mismatches and coerce parameters.
+    Also applies:
+    - Tool output truncation to cap token costs.
+    - Redis response caching for identical calls.
+    - Loop guard: if call_counter is provided, tracks per-tool call counts and
+      returns an early-stop message after MAX_CALLS_PER_TOOL_PER_TURN calls.
     """
+    MAX_CALLS_PER_TOOL_PER_TURN = 3
+
     async def coerced_coroutine(**kwargs):
+        # ── Loop guard: prevent infinite same-tool retries ────────────────────
+        if call_counter is not None:
+            current_count = call_counter.get(tool_inst.name, 0) + 1
+            call_counter[tool_inst.name] = current_count
+            if current_count > MAX_CALLS_PER_TOOL_PER_TURN:
+                msg = (
+                    f"⚠️ STOP LOOPING: '{tool_inst.name}' has already been called "
+                    f"{MAX_CALLS_PER_TOOL_PER_TURN} times this turn. "
+                    f"You have collected enough data. "
+                    f"Do NOT call this tool again. "
+                    f"Immediately proceed to the NEXT step in your plan using the results you already have."
+                )
+                logger.warning(f"[LOOP GUARD] Blocked '{tool_inst.name}' call #{current_count} — forcing agent to proceed.")
+                return msg
+
         logger.info(f"[TOOL INVOKE] Calling tool '{tool_inst.name}' with arguments: {kwargs}")
-        
-        # ── Check Redis cache for identical previous call ──
+
+        # ── Check Redis cache for identical previous call ─────────────────────
         try:
             from database import cache
             cache_key = _get_tool_cache_key(tool_inst.name, kwargs)
@@ -161,35 +205,28 @@ def wrap_tool_with_coercion(tool_inst: BaseTool) -> BaseTool:
                 logger.info(f"[TOOL CACHE HIT] Loaded cached response for '{tool_inst.name}' (0 API tokens).")
                 return cached_result
         except Exception:
-            cache_key = None  # Cache unavailable, proceed normally
-        
+            cache_key = None
+
         try:
             res = await tool_inst.ainvoke(kwargs)
             logger.info(f"[TOOL SUCCESS] Tool '{tool_inst.name}' successfully returned output.")
-            
-            # ── Smart JSON filtering (before truncation) ──
-            # Strip fat from Notion/Cal/generic MCP JSON payloads so the LLM
-            # only sees the fields it actually needs. Saves 50-90% of tokens
-            # on large API responses without losing important data.
-            res = smart_filter_mcp_response(res, tool_inst.name, str(kwargs))
 
-            # ── Truncate oversized outputs (last-resort safety net) ──
+            res = smart_filter_mcp_response(res, tool_inst.name, str(kwargs))
             res = _truncate_tool_output(res, tool_inst.name)
-            
-            # ── Cache the result for 1 hour (MCP data is rarely stale) ──
+
             if cache_key:
                 try:
                     from database import cache
                     await cache.set(cache_key, str(res), ttl=3600)
                 except Exception:
                     pass
-            
+
             return res
         except Exception as e:
             logger.error(f"[TOOL EXCEPTION] Tool '{tool_inst.name}' raised an error: {e}")
             err_msg = str(e)
             is_datatype_error = any(phrase in err_msg for phrase in [
-                "Wrong datatype", "datatype", "type mismatch", "Parameter Input", 
+                "Wrong datatype", "datatype", "type mismatch", "Parameter Input",
                 "Wrong type", "7204", "Parameter"
             ])
             if is_datatype_error:
@@ -202,19 +239,17 @@ def wrap_tool_with_coercion(tool_inst: BaseTool) -> BaseTool:
                     elif isinstance(val, (int, float)):
                         new_kwargs[param] = str(int(val) if isinstance(val, float) and val.is_integer() else val)
                         coerced = True
-                        
+
                 if coerced:
                     logger.warning(
-                        f"[COERCION RETRY] Datatype mismatch error detected for tool '{tool_inst.name}'. "
-                        f"Attempting retry with coerced arguments. Original: {kwargs} -> Coerced: {new_kwargs}"
+                        f"[COERCION RETRY] Datatype mismatch for '{tool_inst.name}'. "
+                        f"Retrying with coerced args: {new_kwargs}"
                     )
                     try:
                         res = await tool_inst.ainvoke(new_kwargs)
-                        logger.info(f"[TOOL SUCCESS] Coerced retry of '{tool_inst.name}' completed successfully.")
+                        logger.info(f"[TOOL SUCCESS] Coerced retry of '{tool_inst.name}' succeeded.")
                         res = smart_filter_mcp_response(res, tool_inst.name, str(new_kwargs))
                         res = _truncate_tool_output(res, tool_inst.name)
-                        # BUG FIX: cache the coerced result so the same args don't repeat
-                        # the error + coercion cycle on every identical call
                         if cache_key:
                             try:
                                 from database import cache
@@ -256,18 +291,13 @@ _MIME_TYPES = {
     ".zip":  "application/zip",
 }
 
-# File extensions that are plain text and can be read directly
 _TEXT_EXTENSIONS = {".txt", ".md", ".json", ".csv", ".py", ".html", ".css", ".js", ".xml", ".yaml", ".yml"}
-
-# File extensions that must be sent as binary (base64) to Google Drive / Gmail
 _BINARY_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".png", ".jpg", ".jpeg", ".gif", ".zip"}
 
 
 def get_read_uploaded_file_tool(upload_dir: str):
     """
     Creates and returns the `read_uploaded_file` tool bound to the specified upload directory.
-    Use this to READ/ANALYSE file contents. For uploading files to Google Drive use
-    `prepare_file_for_upload` instead.
     """
     @tool
     def read_uploaded_file(filename: str) -> str:
@@ -275,8 +305,7 @@ def get_read_uploaded_file_tool(upload_dir: str):
         Read and extract the TEXT contents of a local file uploaded by the user.
         Use this tool to READ, ANALYSE, or SUMMARISE a file's content.
         For uploading a file to Google Drive or Gmail use the
-        `prepare_file_for_upload` tool instead — it returns the correct
-        base64-encoded binary content and MIME type that Google requires.
+        `prepare_file_for_upload` tool instead.
         """
         safe_filename = os.path.basename(filename)
         file_path = os.path.join(upload_dir, safe_filename)
@@ -338,20 +367,7 @@ def get_read_uploaded_file_tool(upload_dir: str):
 
 
 def get_prepare_file_for_upload_tool(upload_dir: str):
-    """
-    Creates and returns the `prepare_file_for_upload` tool.
-
-    This is the CORRECT tool to use before uploading any file to Google Drive or Gmail.
-    It returns:
-      - base64-encoded binary content  (for PDFs, DOCX, images, etc.)
-      - OR plain text content          (for .txt, .csv, .md, etc.)
-      - MIME type string               (always included)
-
-    Google Drive's `create_file` tool requires:
-        name        = filename
-        mimeType    = value returned by this tool
-        content     = value returned by this tool  (base64 for binary, text for text)
-    """
+    """Creates and returns the `prepare_file_for_upload` tool."""
     @tool
     def prepare_file_for_upload(filename: str) -> str:
         """
@@ -360,13 +376,9 @@ def get_prepare_file_for_upload_tool(upload_dir: str):
         like PDF/DOCX/images, plain text for .txt/.csv/.md) and its MIME type.
 
         ALWAYS call this tool before calling Google Drive's create_file or
-        Gmail's send_email with an attachment. Never pass extracted text from
-        `read_uploaded_file` to Google Drive — that causes 'invalid document' errors
-        because Google Drive expects raw binary content (base64), not extracted text.
+        Gmail's send_email with an attachment.
 
         Returns a JSON string with keys: filename, mime_type, content, encoding.
-        Pass `content` as the file content and `mime_type` as the mimeType argument
-        to Google Drive's create_file tool.
         """
         import base64
         import json as _json
@@ -388,8 +400,6 @@ def get_prepare_file_for_upload_tool(upload_dir: str):
                     content = f.read()
                 encoding = "text"
             else:
-                # Binary file — base64 encode it so it can be passed as a string
-                # to Google Drive's create_file tool without corruption
                 with open(file_path, "rb") as f:
                     raw_bytes = f.read()
                 content = base64.b64encode(raw_bytes).decode("utf-8")
@@ -416,9 +426,7 @@ def get_prepare_file_for_upload_tool(upload_dir: str):
     return prepare_file_for_upload
 
 def get_query_documentation_tool(loaded_docs: Dict[str, Any]):
-    """
-    Creates and returns the `query_documentation` tool loaded with the active resources.
-    """
+    """Creates and returns the `query_documentation` tool loaded with the active resources."""
     @tool
     async def query_documentation(query: str) -> str:
         """
@@ -431,7 +439,6 @@ def get_query_documentation_tool(loaded_docs: Dict[str, Any]):
         if not loaded_docs:
             return "No documentation resources have been loaded yet."
 
-        # 1. Attempt Semantic Vector Search via Redis & Azure OpenAI if Redis is online
         if cache.is_available:
             logger.info(f"[DOC SEARCH] Redis active. Running semantic vector search...")
             try:
@@ -446,16 +453,15 @@ def get_query_documentation_tool(loaded_docs: Dict[str, Any]):
                         )
                     return "\n\n=================================\n\n".join(formatted_res)
                 else:
-                    logger.info("[DOC SEARCH] Semantic vector search returned no results. Falling back to keyword search.")
+                    logger.info("[DOC SEARCH] Semantic search returned no results. Falling back to keyword search.")
             except Exception as e:
-                logger.error(f"[DOC SEARCH ERROR] Semantic vector search failed: {e}. Falling back to keyword search.")
+                logger.error(f"[DOC SEARCH ERROR] Semantic search failed: {e}. Falling back to keyword search.")
 
-        # 2. Fallback Keyword/Regex-based Search
         logger.info("[DOC SEARCH] Running standard keyword search...")
         words = [w.lower() for w in re.findall(r"\b\w{3,}\b", query)]
         if not words:
             return "Query was too short or lacked search keywords."
-        
+
         results = []
         for doc_name, doc in loaded_docs.items():
             content = doc["content"]
@@ -469,29 +475,29 @@ def get_query_documentation_tool(loaded_docs: Dict[str, Any]):
                     current_section.append(line)
             if current_section:
                 sections.append("\n".join(current_section))
-                
+
             scored_sections = []
             for sec in sections:
                 sec_lower = sec.lower()
                 score = sum(sec_lower.count(word) for word in words)
                 if score > 0:
                     scored_sections.append((score, sec))
-            
+
             scored_sections.sort(key=lambda x: x[0], reverse=True)
             doc_results = [sec.strip() for score, sec in scored_sections[:3]]
-                
+
             if doc_results:
                 formatted_res = f"--- From Doc: {doc_name} ({doc['url']}) ---\n" + "\n\n...\n\n".join(doc_results)
                 results.append(formatted_res)
-                
+
         if not results:
-            fallback = [f"--- Doc: {doc_name} ({doc['url']}) ---\nPreview:\n{doc['content'][:600]}..." 
+            fallback = [f"--- Doc: {doc_name} ({doc['url']}) ---\nPreview:\n{doc['content'][:600]}..."
                         for doc_name, doc in loaded_docs.items()]
             return "No exact matches found for query. Here are previews of available docs:\n\n" + "\n\n".join(fallback)
-            
+
         logger.info(f"[DOC SEARCH SUCCESS] Found matches for query: '{query}'")
         return "\n\n=================================\n\n".join(results)
-        
+
     return query_documentation
 
 
@@ -501,7 +507,6 @@ def web_search(query: str) -> str:
     Search the internet/Google for real-time information, news, company details,
     website URLs, phone numbers, contact links, or address details. Returns search result snippets.
     """
-    # 1. Check for Tavily Key
     tavily_key = os.getenv("TAVILY_API_KEY")
     if tavily_key:
         logger.info(f"[TAVILY SEARCH] Querying Tavily: '{query}'...")
@@ -525,8 +530,7 @@ def web_search(query: str) -> str:
                     return "\n\n".join(lines)
         except Exception as e:
             logger.error(f"[TAVILY SEARCH ERROR] Falling back to DuckDuckGo: {e}")
-            
-    # 2. DuckDuckGo Fallback
+
     logger.info(f"[DDG SEARCH] Querying DuckDuckGo: '{query}'...")
     try:
         headers = {
@@ -536,10 +540,9 @@ def web_search(query: str) -> str:
         resp = httpx.get(url, headers=headers, timeout=12.0)
         if resp.status_code == 200:
             html = resp.text
-            # Extract URLs and Titles
             a_tags = re.findall(r'<a\s+class="result__a"\s+href="([^"]+)">([^<]+)</a>', html)
             snippets = re.findall(r'<a\s+class="result__snippet"[^>]*>([^<]+)</a>', html)
-            
+
             results = []
             for i in range(min(5, len(a_tags))):
                 url_raw = a_tags[i][0]
@@ -549,19 +552,17 @@ def web_search(query: str) -> str:
                     url_clean = url_raw
                 title_clean = a_tags[i][1].strip()
                 snippet_clean = snippets[i].strip() if i < len(snippets) else "No snippet available."
-                
-                # Clean nested tags
                 title_clean = re.sub(r'<[^>]*>', '', title_clean)
                 snippet_clean = re.sub(r'<[^>]*>', '', snippet_clean)
                 results.append(f"{i+1}. {title_clean}\n   URL: {url_clean}\n   Snippet: {snippet_clean}")
-                
+
             if results:
                 return "\n\n".join(results)
             return "No search results found on DuckDuckGo."
     except Exception as e:
         logger.error(f"[DDG SEARCH ERROR] Failed DDG search: {e}")
         return f"Error executing web search: {e}"
-    
+
     return "Error: Web search failed."
 
 
@@ -576,10 +577,9 @@ def web_scrape(url: str) -> str:
     if not url.startswith("http"):
         url = "https://" + url
 
-    # 1. Check for Tavily Key
     tavily_key = os.getenv("TAVILY_API_KEY")
     scraped_text = ""
-    
+
     if tavily_key:
         logger.info(f"[TAVILY EXTRACT] Querying Tavily Extract API for {url}...")
         try:
@@ -597,7 +597,6 @@ def web_scrape(url: str) -> str:
         except Exception as e:
             logger.error(f"[TAVILY EXTRACT ERROR] Falling back to local/Jina: {e}")
 
-    # 2. Direct Fetch Fallback
     if not scraped_text:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -617,7 +616,6 @@ def web_scrape(url: str) -> str:
         except Exception as e:
             logger.warning(f"[LOCAL SCRAPE FAILED] Direct fetch failed for {url}: {e}. Trying Jina proxy...")
 
-    # 3. Jina Reader Fallback
     if not scraped_text:
         logger.info(f"[JINA SCRAPE] Querying Jina Reader Proxy for {url}...")
         try:
@@ -633,7 +631,6 @@ def web_scrape(url: str) -> str:
     if not scraped_text:
         return "Error: Could not retrieve webpage content."
 
-    # 4. Save to workspace!
     try:
         from config import UPLOAD_DIR
         os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -641,21 +638,17 @@ def web_scrape(url: str) -> str:
         domain = domain_match.group(1).replace(".", "_") if domain_match else "site"
         safe_filename = f"scraped_{domain}.md"
         file_path = os.path.join(UPLOAD_DIR, safe_filename)
-        
+
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(f"# Scraped Content from: {url}\n\n{scraped_text}")
         logger.info(f"[WORKSPACE SAVE] Saved scraped page content to '{file_path}'")
 
-        # BUG FIX: register the scraped file in state so it appears in /files and the
-        # agent can reference it in future turns — previously it was saved to disk but
-        # never added to state["uploaded_files"]
         try:
             import time as _time
             from database.state_manager import load_state, save_state
             state_data = load_state()
             if "uploaded_files" not in state_data:
                 state_data["uploaded_files"] = []
-            # Replace any stale entry with the same filename
             state_data["uploaded_files"] = [
                 f for f in state_data["uploaded_files"] if f.get("name") != safe_filename
             ]

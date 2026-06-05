@@ -1,20 +1,16 @@
 """
 LangGraph ReAct Agent Execution Module.
 
-Constructs and executes the streaming multi-server LangGraph ReAct agent.
-Integrates dynamic MCP clients, binds local search/workspace helper tools,
-and coordinates pre-execution strategic planners.
-
-Memory strategy (post-Redis migration):
-  - LangGraph MemorySaver is passed as `checkpointer` to create_react_agent.
-  - Each conversation is identified by a `thread_id`; LangGraph manages the
-    full message state per thread automatically.
-  - On the FIRST call for a thread the caller provides prior `history` to seed
-    the checkpoint.  On subsequent calls only the new message is passed — 
-    LangGraph appends it to the existing checkpoint state.
-  - compress_history_sandwich() is still called for the initial seed to prune
-    noise and stay within token limits; it uses the LangGraph InMemoryStore
-    cache (no Redis).
+Key improvements in this version:
+  1. Per-turn tool call counter passed into wrap_tool_with_coercion —
+     blocks the same tool after 3 calls per turn and forces the agent forward.
+  2. recursion_limit set to 12 in thread_config — hard ceiling on agent steps.
+  3. System prompt now includes explicit STOP / ACT conditions so the agent
+     proceeds to output once it has collected enough data.
+  4. Planner prompt improved to emit a "gather → act" pattern with an
+     explicit completion trigger.
+  5. Tool RAG deduplication: the planner's requested tools are compared
+     against the semantic top-K so the correct tools are always loaded.
 """
 
 import asyncio
@@ -46,27 +42,19 @@ from utils.token_counter import count_tokens
 logger = logging.getLogger("mcp_backend")
 
 # ── Thread tracking ────────────────────────────────────────────────────────────
-# Tracks which thread_ids have already been seeded into the MemorySaver.
-# On the first call for a thread we pass the full (compressed) history.
-# On every subsequent call we pass only the new user message — LangGraph
-# automatically loads and appends to the existing checkpoint state.
 _INITIALIZED_THREADS: set = set()
+
+# Maximum agent steps per turn — keeps costs predictable and prevents runaway loops.
+AGENT_RECURSION_LIMIT = 12
+
+# Maximum times the same tool may be called within a single turn.
+# After this the loop-guard wrapper returns a stop message instead of calling the tool.
+MAX_TOOL_CALLS_PER_TURN = 3
 
 
 def _reset_thread_checkpoint(thread_id: str) -> None:
-    """
-    Removes a thread from both the initialized-set and the MemorySaver storage
-    so the next call re-seeds it with clean history.
-
-    Called when dangling tool_calls (AIMessage with no matching ToolMessage)
-    are detected in a checkpoint — either proactively (pre-flight) or reactively
-    (error handler).  Both paths are safe: if the key is already absent the
-    list-comprehension produces an empty list and nothing breaks.
-    """
     _INITIALIZED_THREADS.discard(thread_id)
     try:
-        # MemorySaver stores checkpoints in .storage keyed by
-        # (thread_id, checkpoint_ns, checkpoint_id) tuples.
         keys_to_drop = [
             k for k in list(checkpointer.storage)
             if isinstance(k, tuple) and len(k) > 0 and k[0] == thread_id
@@ -86,11 +74,6 @@ def _reset_thread_checkpoint(thread_id: str) -> None:
 # ── Dynamic prompt helpers ─────────────────────────────────────────────────────
 
 def _infer_server_capabilities(tool_names: List[str]) -> List[str]:
-    """
-    Maps raw MCP tool names to human-readable capability labels so the sifter
-    and planner prompts describe what each server can *do* rather than listing
-    opaque tool identifiers.
-    """
     caps = set()
     name_blob = " ".join(tool_names).lower()
     rules = [
@@ -112,10 +95,6 @@ def _infer_server_capabilities(tool_names: List[str]) -> List[str]:
 
 
 def _extract_recent_topics(history: List[Dict[str, str]], n: int = 4) -> str:
-    """
-    Returns a compact one-line summary of the last *n* user messages so the
-    sifter can factor in recent conversation context without blowing the prompt.
-    """
     recent = [m.get("content", "") for m in history if m.get("role") == "user"][-n:]
     if not recent:
         return "none"
@@ -128,11 +107,6 @@ def build_dynamic_sifter_prompt(
     all_mcp_tools: Dict[str, list],
     history: List[Dict[str, str]],
 ) -> str:
-    """
-    Builds a fully context-aware classification prompt that reflects exactly
-    which servers are connected and what they can do, plus recent conversation
-    topics to avoid misclassifying follow-up queries.
-    """
     action_group_lines = []
     for server_name, tools in all_mcp_tools.items():
         tool_names = [getattr(t, "name", "") for t in tools]
@@ -181,12 +155,9 @@ def build_dynamic_planner_prompt(
     all_mcp_tools: Dict[str, list],
 ) -> str:
     """
-    Builds a planner system prompt that lists ONLY the servers that are actually
-    connected (with live tool counts) so the agent never references a service
-    the user hasn't set up.
-
-    Output is a JSON array of ordered steps — each step names the exact tool
-    so the agent executes them in strict sequence without guessing the order.
+    Builds a planner prompt that produces a strict gather → act plan.
+    The plan always ends with an explicit 'CREATE OUTPUT' step so the agent
+    knows to stop collecting data and produce the final result.
     """
     server_lines = []
     for name in state.get("mcp_servers", {}):
@@ -205,28 +176,28 @@ def build_dynamic_planner_prompt(
         "## Active servers and tools\n"
         f"{servers_text}\n\n"
         "## Your task\n"
-        f"Generate a precise, ordered execution plan to fulfil: \"{query}\"\n\n"
+        f"Generate a precise, ordered execution plan for: \"{query}\"\n\n"
+        "## CRITICAL PLANNING RULES\n"
+        "- The plan MUST follow the 'GATHER → ACT' pattern:\n"
+        "  1. First steps: collect all needed data (search/fetch/list)\n"
+        "  2. Final step: create/write/post the output in ONE tool call\n"
+        "- NEVER plan more than 2 data-gathering steps for the same source.\n"
+        "  If the user asks for N items, gather them in at most 2 calls then act.\n"
+        "- The LAST step must always be the 'create output' action "
+        "  (e.g. notion-create-pages, gmail-send, etc.).\n"
+        "- Use ONLY tool names from the list above — never invent tools.\n\n"
         "## Output format — MANDATORY\n"
         "Output ONLY a raw JSON array — no markdown, no explanation:\n"
         "[\n"
         "  {\"step\": 1, \"tool\": \"<exact_tool_name>\", \"purpose\": \"<one sentence>\"},\n"
         "  {\"step\": 2, \"tool\": \"<exact_tool_name>\", \"purpose\": \"<one sentence>\"}\n"
         "]\n\n"
-        "## Rules\n"
-        "- Use ONLY tool names from the list above — never invent tools.\n"
-        "- Steps MUST be in logical execution order (e.g. search before scrape, "
-        "fetch data before create).\n"
-        "- If web search is needed, use tool name 'web_search'.\n"
+        "- Steps MUST be in logical execution order.\n"
         "- Do NOT execute any tools — output the plan only."
     )
 
 
 def _parse_structured_plan(raw: str) -> list:
-    """
-    Parses the planner's JSON output into a list of step dicts.
-    Falls back to a single-step list if parsing fails so the agent
-    always gets something actionable.
-    """
     try:
         cleaned = re.sub(r"```json\s*|\s*```", "", raw.strip()).strip()
         steps = json.loads(cleaned)
@@ -242,11 +213,6 @@ async def compress_history_sandwich(
     llm_inst,
     cheap_llm_inst=None,
 ) -> List[Dict[str, str]]:
-    """
-    Compresses chat history for the initial thread seed.
-    Uses cheap_llm_inst (if provided) for tone detection + summarisation
-    to avoid burning primary-model tokens on internal bookkeeping.
-    """
     _summariser = cheap_llm_inst if cheap_llm_inst is not None else llm_inst
     noise_patterns = [
         r"^(hi|hello|hey|greetings|howdy|ok|ok bro|thanks|thank you|ok thanks|cool)$"
@@ -280,8 +246,7 @@ async def compress_history_sandwich(
     else:
         logger.info("[HISTORY COMPRESS] Detecting conversation tone...")
         tone_map = {
-            "technical":  "Use precise technical terminology; preserve tool names, "
-                          "IDs, and specific details.",
+            "technical":  "Use precise technical terminology; preserve tool names, IDs, and specific details.",
             "casual":     "Use relaxed, plain language; focus on the key points only.",
             "formal":     "Use professional, concise language; avoid contractions.",
         }
@@ -330,6 +295,43 @@ async def compress_history_sandwich(
 _MCP_TOOLS_CACHE: Dict[str, list] = {}
 
 
+def _build_anti_loop_instructions(tools_loaded: list) -> str:
+    """
+    Returns a block of STOP/ACT rules appended to every agent system prompt.
+    These are the most important lines in the prompt — they prevent the infinite
+    search-paginate-search loop seen in the original recursion-limit crashes.
+    """
+    tool_names = [getattr(t, "name", str(t)) for t in tools_loaded]
+    tools_str = ", ".join(f"`{n}`" for n in tool_names[:10])
+    return (
+        "\n\n---\n"
+        "## ⚠️ MANDATORY EXECUTION RULES — READ BEFORE CALLING ANY TOOL\n\n"
+        "### Rule 1 — GATHER THEN ACT (most important)\n"
+        "Your job has two phases:\n"
+        "  Phase 1 (GATHER): Call data-fetching tools to collect what you need.\n"
+        "  Phase 2 (ACT):    Call the output tool ONCE with ALL collected data.\n"
+        "Never stay in Phase 1 indefinitely. Move to Phase 2 as soon as you have "
+        "enough data — even if it's not perfectly complete.\n\n"
+        "### Rule 2 — NO SAME-TOOL LOOPS\n"
+        f"You have {len(tool_names)} tools available: {tools_str}.\n"
+        "You may call any single tool at most 3 times per response.\n"
+        "If a tool returns a loop-guard warning, STOP calling it immediately "
+        "and proceed to Phase 2 with whatever data you have.\n\n"
+        "### Rule 3 — QUANTITY REQUESTS\n"
+        "If the user asks for N items (e.g. '10 jobs'), collect up to N items "
+        "across at most 2 search calls, then immediately create the output.\n"
+        "Do NOT paginate beyond page 2 or 3 for any single query.\n\n"
+        "### Rule 4 — TRUST TRUNCATED RESULTS\n"
+        "If a tool result ends with '[Output truncated ...]', that means you have "
+        "enough data. Do NOT retry the same call to get more — proceed to ACT.\n\n"
+        "### Rule 5 — ONE CREATION CALL\n"
+        "Calls that create pages, send emails, or post content must happen exactly "
+        "ONCE, containing ALL data gathered in Phase 1. Never split creation across "
+        "multiple tool calls.\n"
+        "---\n"
+    )
+
+
 async def stream_agent_interaction(
     prompt: str,
     history: List[Dict[str, str]],
@@ -339,23 +341,16 @@ async def stream_agent_interaction(
     """
     Streams the ReAct agent's thoughts, tool invocations, and final response
     back to the frontend via Server-Sent Events (SSE).
-
-    thread_id  — identifies the conversation in LangGraph's MemorySaver.
-                 First call for a thread seeds it with compressed history.
-                 Subsequent calls pass only the new message.
     """
     llm_inst = get_llm()
 
     # ── 0. Decide input messages based on thread state ─────────────────────────
     is_new_thread = thread_id not in _INITIALIZED_THREADS
 
-    # Always compute compressed_history so the planning phase can reference it
-    # regardless of whether this is a new or existing thread.
     cheap_llm = get_cheap_llm()
     compressed_history = await compress_history_sandwich(history, llm_inst, cheap_llm_inst=cheap_llm)
 
     if is_new_thread:
-        # First time: seed the checkpoint with compressed prior context
         msgs = []
         for h in compressed_history:
             role    = h.get("role")
@@ -368,19 +363,16 @@ async def stream_agent_interaction(
         _INITIALIZED_THREADS.add(thread_id)
         logger.info(f"[AGENT] New thread '{thread_id}' — seeding with {len(msgs)} messages.")
     else:
-        # Existing thread: LangGraph loads full history from MemorySaver
         msgs = [HumanMessage(content=prompt)]
         logger.info(f"[AGENT] Existing thread '{thread_id}' — passing new message only.")
 
-    # ── 1. Pre-fetch MCP tools (token-rotation-safe cache) ────────────────────
+    # ── 1. Pre-fetch MCP tools ─────────────────────────────────────────────────
     global _MCP_TOOLS_CACHE
     all_mcp_tools: Dict[str, list] = {}
 
     if state.get("mcp_servers"):
         servers_to_fetch = {}
         for name, s in state["mcp_servers"].items():
-            # Normalize URL: keep only scheme+netloc+path, strip query/fragment
-            # so auth tokens in query params don't create stale cache entries.
             from urllib.parse import urlparse
             _raw_url = s.get("url", "")
             _p = urlparse(_raw_url)
@@ -414,7 +406,7 @@ async def stream_agent_interaction(
 
             await asyncio.gather(*[_fetch_one(n) for n in configs.keys()])
 
-    # ── 2. Smart Sifter (cached in LangGraph InMemoryStore) ───────────────────
+    # ── 2. Smart Sifter ────────────────────────────────────────────────────────
     total_input_tokens  = 0
     total_output_tokens = 0
     needs_plan  = True
@@ -422,7 +414,6 @@ async def stream_agent_interaction(
     tool_groups = []
     plan_text   = ""
 
-    # ── Fast-path: skip sifter entirely for obvious trivial queries ───────────
     _TRIVIAL_PHRASES = {
         "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "ok thanks",
         "ok bro", "cool", "got it", "sounds good", "great", "perfect", "bye",
@@ -480,9 +471,6 @@ async def stream_agent_interaction(
 
             logger.info(f"[PLANNER] Sifter decision: {category} | {tool_groups}")
 
-        # ── Hard override: force 'Local' (web search) for any real-time query ──
-        # This runs after both cache-hit and fresh classification so it can never
-        # be bypassed by a stale cached sifter result.
         _REALTIME_KEYWORDS = {
             "current", "currently", "today", "now", "latest", "recent", "recently",
             "right now", "live", "breaking", "this week", "this month", "this year",
@@ -492,8 +480,6 @@ async def stream_agent_interaction(
         if _prompt_tokens & _REALTIME_KEYWORDS:
             if "Local" not in tool_groups:
                 tool_groups.append("Local")
-            # Conversational classification is wrong for real-time queries —
-            # upgrade to DIRECT_TOOL so the web search tool actually gets loaded.
             if "CONVERSATIONAL" in category:
                 category = "DIRECT_TOOL"
             logger.info(f"[PLANNER] Real-time keyword override applied → {category} | {tool_groups}")
@@ -508,10 +494,6 @@ async def stream_agent_interaction(
         else:
             needs_plan = needs_tools = True
 
-        # ── Ambiguity detection: multiple MCP servers matched + vague query ──
-        # If the sifter picked 2+ non-Local tool groups and the query contains
-        # no explicit service name, ask the user to clarify rather than
-        # silently guessing the wrong source.
         _mcp_groups = [g for g in tool_groups if g != "Local"]
         if len(_mcp_groups) > 1 and "CONVERSATIONAL" not in category:
             _explicit_mentions = [g for g in _mcp_groups if g.lower() in prompt.lower()]
@@ -530,8 +512,6 @@ async def stream_agent_interaction(
         needs_plan = needs_tools = True
         tool_groups = list(state.get("mcp_servers", {}).keys()) + ["Local"]
 
-        # Bug #8 fix: if tool-fetch in step 1 also failed for some servers,
-        # attempt a second fetch now so the agent actually has tools available.
         if state.get("mcp_servers"):
             from urllib.parse import urlparse as _up
             missing = {
@@ -556,13 +536,21 @@ async def stream_agent_interaction(
                         logger.error(f"[PLANNER FALLBACK] Re-fetch still failed for '{name}': {refetch_err}")
 
     # ── 3. Resolve tools ───────────────────────────────────────────────────────
+    # Per-turn call counter — shared mutable dict passed into every tool wrapper
+    # so the loop-guard can count calls across all tools in this one agent turn.
+    turn_call_counter: Dict[str, int] = {}
+
     tools = []
 
     if needs_tools:
         for name in tool_groups:
             for server_name in all_mcp_tools:
                 if name.lower() in server_name.lower() or server_name.lower() in name.lower():
-                    tools.extend([wrap_tool_with_coercion(t) for t in all_mcp_tools[server_name]])
+                    # Pass the per-turn counter into each wrapper so loop-guard works
+                    tools.extend([
+                        wrap_tool_with_coercion(t, call_counter=turn_call_counter)
+                        for t in all_mcp_tools[server_name]
+                    ])
                     logger.info(f"[CHAT] Loaded {len(all_mcp_tools[server_name])} tools from '{server_name}'.")
                     break
 
@@ -579,7 +567,28 @@ async def stream_agent_interaction(
 
         if tools:
             from database import retrieve_relevant_tools
-            tools = await retrieve_relevant_tools(prompt, tools, top_k=5)
+            # ── Tool RAG with SSE keepalive ───────────────────────────────────
+            # Embedding 50+ tools takes 9-15s. Without heartbeats the frontend
+            # SSE connection times out before the agent even starts.
+            yield "event: thought\ndata: {\"text\": \"🔍 Selecting best tools for this task...\"}\n\n"
+            rag_task = asyncio.create_task(
+                retrieve_relevant_tools(prompt, tools, top_k=8)
+            )
+            while not rag_task.done():
+                yield "event: keepalive\ndata: {}\n\n"
+                await asyncio.sleep(2)
+            tools = rag_task.result()
+            # Pin tools explicitly named in the plan — RAG may miss low-scoring
+            # but mandatory tools like notion-create-pages.
+            if plan_text:
+                pinned_names = set(re.findall(r"\[([^\]]+)\]", plan_text))
+                active_names = {getattr(t, "name", "") for t in tools}
+                full_pool = [t for lst in all_mcp_tools.values() for t in lst]
+                for t in full_pool:
+                    tname = getattr(t, "name", "")
+                    if tname in pinned_names and tname not in active_names:
+                        logger.info(f"[TOOL RAG] Pinning plan-required tool: {tname}")
+                        tools.append(wrap_tool_with_coercion(t, call_counter=turn_call_counter))
 
     # ── 4. Strategic Planning Phase ───────────────────────────────────────────
     if needs_plan:
@@ -605,13 +614,11 @@ async def stream_agent_interaction(
             raw_plan  = plan_response.content if hasattr(plan_response, "content") else str(plan_response)
             plan_steps = _parse_structured_plan(raw_plan)
 
-            # Convert structured steps back into readable text for the system prompt
             plan_text = "\n".join(
                 f"Step {s.get('step', i+1)}: [{s.get('tool','auto')}] {s.get('purpose','')}"
                 for i, s in enumerate(plan_steps)
             )
 
-            # Show a clean numbered list in the UI thought panel
             display_plan = "\n".join(
                 f"{s.get('step', i+1)}. {s.get('purpose','')} → `{s.get('tool','auto')}`"
                 for i, s in enumerate(plan_steps)
@@ -623,6 +630,8 @@ async def stream_agent_interaction(
 
     # ── 5. Build system prompt ─────────────────────────────────────────────────
     base_prompt = build_system_prompt(state, active_groups=tool_groups)
+    anti_loop   = _build_anti_loop_instructions(tools)
+
     _search_instruction = (
         "After calling web_search or web_scrape, always present the results as a "
         "concise, readable summary — highlight key facts, dates, and names. "
@@ -632,9 +641,10 @@ async def stream_agent_interaction(
         system_prompt = (
             f"{base_prompt}\n\n"
             f"{_search_instruction}"
-            f"### STRATEGIC PLAN TO FOLLOW (execute steps in this exact order):\n{plan_text}\n\n"
+            f"### STRATEGIC PLAN — execute steps in this exact order:\n{plan_text}\n\n"
             "Use your tools as dictated by the plan. When scraping websites, extract details "
-            "via LLM context—do not use regex. Enrich CRM with discovered data."
+            "via LLM context — do not use regex. Enrich CRM with discovered data."
+            f"{anti_loop}"
         )
     elif needs_tools:
         system_prompt = (
@@ -642,6 +652,7 @@ async def stream_agent_interaction(
             f"{_search_instruction}"
             "Respond directly or execute required tools immediately. "
             "If tools are needed, call them. Otherwise give a clear direct response."
+            f"{anti_loop}"
         )
     else:
         system_prompt = (
@@ -649,16 +660,19 @@ async def stream_agent_interaction(
             "Respond to the user's greeting or chat in a brief and pleasant manner."
         )
 
-    # ── 6. Execute agent with LangGraph MemorySaver ───────────────────────────
-    logger.info(f"[AGENT] Streaming with thread_id='{thread_id}', tools={len(tools)}")
+    # ── 6. Execute agent ───────────────────────────────────────────────────────
+    logger.info(f"[AGENT] Streaming with thread_id='{thread_id}', tools={len(tools)}, recursion_limit={AGENT_RECURSION_LIMIT}")
     if needs_plan:
         yield f"event: thought\ndata: {json.dumps({'text': '🧠 Executing plan with dynamic tools...'})}\n\n"
 
-    thread_config = {"configurable": {"thread_id": thread_id}}
+    # recursion_limit lives in the top-level config, not inside configurable.
+    thread_config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": AGENT_RECURSION_LIMIT,
+    }
 
     try:
         if tools:
-            # MemorySaver passed as checkpointer — LangGraph handles history per thread_id
             agent = create_react_agent(
                 llm_inst,
                 tools,
@@ -666,12 +680,7 @@ async def stream_agent_interaction(
                 checkpointer=checkpointer,
             )
 
-            # ── Pre-flight: heal dangling tool calls before streaming ──────────
-            # If a previous stream was interrupted mid-tool-call (e.g. client
-            # disconnect, server restart) the checkpoint contains an AIMessage
-            # with tool_calls but no matching ToolMessage.  Most LLM providers
-            # reject that history with INVALID_CHAT_HISTORY.  Detect and reset
-            # the thread here so the user never sees the error.
+            # ── Pre-flight: heal dangling tool calls ──────────────────────────
             if thread_id in _INITIALIZED_THREADS:
                 try:
                     cp_tuple = await checkpointer.aget_tuple(
@@ -700,7 +709,6 @@ async def stream_agent_interaction(
                                 f"found in thread '{thread_id}'. Auto-resetting checkpoint."
                             )
                             _reset_thread_checkpoint(thread_id)
-                            # Re-seed msgs with full compressed history so context is preserved
                             msgs = []
                             for h in compressed_history:
                                 role = h.get("role"); content = h.get("content", "")
@@ -714,7 +722,6 @@ async def stream_agent_interaction(
                     logger.warning(
                         f"[AGENT] Pre-flight checkpoint check failed (non-fatal): {pre_err}"
                     )
-            # ── End pre-flight ─────────────────────────────────────────────────
 
             async for chunk in agent.astream({"messages": msgs}, config=thread_config):
                 if "agent" in chunk:
@@ -736,7 +743,6 @@ async def stream_agent_interaction(
                         logger.info(f"[TOOL RESPONSE] {msg.name}")
                         yield f"event: tool_output\ndata: {json.dumps({'name': msg.name, 'content': str(msg.content)})}\n\n"
         else:
-            # Conversational path — no tools, no checkpointer needed
             logger.info("[CHAT] No tools. Streaming direct LLM response...")
             full_msgs = [SystemMessage(content=system_prompt)] + msgs
             total_input_tokens += sum(count_tokens(m.content) for m in full_msgs)
@@ -753,9 +759,6 @@ async def stream_agent_interaction(
 
     except Exception as e:
         err_str = str(e)
-        # Fallback: if the pre-flight missed a dangling tool call (e.g. the
-        # checkpointer uses a non-standard storage layout), reset the thread so
-        # the NEXT call auto-heals, and surface a clear retry message.
         if "AIMessages with tool_calls" in err_str or "INVALID_CHAT_HISTORY" in err_str:
             logger.warning(
                 f"[AGENT] INVALID_CHAT_HISTORY in thread '{thread_id}' — "
@@ -764,6 +767,13 @@ async def stream_agent_interaction(
             _reset_thread_checkpoint(thread_id)
             yield (
                 f"event: error\ndata: {json.dumps({'message': 'Your conversation history was reset after an interrupted tool call. Please resend your last message and the agent will continue normally.'})}\n\n"
+            )
+            return
+        # Recursion limit hit — surface a clear, friendly message
+        if "recursion" in err_str.lower() or "GRAPH_RECURSION_LIMIT" in err_str:
+            logger.error(f"[AGENT] Recursion limit ({AGENT_RECURSION_LIMIT}) hit for thread '{thread_id}'.")
+            yield (
+                f"event: error\ndata: {json.dumps({'message': f'The task required too many steps to complete automatically. Try breaking it into smaller parts, or be more specific about what you need (e.g. specify the exact service to use).'})}\n\n"
             )
             return
         logger.error(f"[CHAT ERROR] {e}", exc_info=True)

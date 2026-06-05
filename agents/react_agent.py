@@ -1,16 +1,23 @@
 """
-LangGraph ReAct Agent Execution Module.
+LangGraph ReAct Agent — Fixed & Enhanced.
 
-Key improvements in this version:
-  1. Per-turn tool call counter passed into wrap_tool_with_coercion —
-     blocks the same tool after 3 calls per turn and forces the agent forward.
-  2. recursion_limit set to 12 in thread_config — hard ceiling on agent steps.
-  3. System prompt now includes explicit STOP / ACT conditions so the agent
-     proceeds to output once it has collected enough data.
-  4. Planner prompt improved to emit a "gather → act" pattern with an
-     explicit completion trigger.
-  5. Tool RAG deduplication: the planner's requested tools are compared
-     against the semantic top-K so the correct tools are always loaded.
+Root-cause fixes applied vs previous version
+─────────────────────────────────────────────
+1. LOOP BUG: Agent spent all 12 recursion steps on wrong tools (notion-search ×3,
+   get_companies ×2) and never reached notion-create-pages.
+   Fix → task_type detection in Sifter; creation tools ALWAYS pinned; search tools
+   excluded from tool list when task_type == "CREATE".
+
+2. RECURSION: Limit raised 12 → 18 so even a misbehaving plan has budget to finish.
+
+3. PLAN PINNING: Normalised tool-name comparison (strip hyphens/underscores/case) so
+   "notion-create-pages" in the plan matches the actual MCP tool regardless of casing.
+
+4. PROMPTS: Sifter, Planner, Anti-loop, and System prompts all rewritten for clarity
+   and to produce formatted, readable output (not raw JSON dumps).
+
+5. MAX_TOOL_CALLS_PER_TURN lowered 3 → 2 in the loop-guard so the agent hits the
+   guardrail faster and still has budget left to call the creation tool.
 """
 
 import asyncio
@@ -35,7 +42,7 @@ from tools import (
     get_prepare_file_for_upload_tool,
     get_query_documentation_tool,
     web_search,
-    web_scrape
+    web_scrape,
 )
 from utils.token_counter import count_tokens
 
@@ -44,12 +51,11 @@ logger = logging.getLogger("mcp_backend")
 # ── Thread tracking ────────────────────────────────────────────────────────────
 _INITIALIZED_THREADS: set = set()
 
-# Maximum agent steps per turn — keeps costs predictable and prevents runaway loops.
-AGENT_RECURSION_LIMIT = 12
+# Raised from 12 → 18 so even multi-step plans have room to finish.
+AGENT_RECURSION_LIMIT = 18
 
-# Maximum times the same tool may be called within a single turn.
-# After this the loop-guard wrapper returns a stop message instead of calling the tool.
-MAX_TOOL_CALLS_PER_TURN = 3
+# Lowered from 3 → 2: hit the guardrail faster, preserve budget for creation step.
+MAX_TOOL_CALLS_PER_TURN = 2
 
 
 def _reset_thread_checkpoint(thread_id: str) -> None:
@@ -66,9 +72,13 @@ def _reset_thread_checkpoint(thread_id: str) -> None:
             f"({len(keys_to_drop)} entries cleared)."
         )
     except Exception as ce:
-        logger.warning(
-            f"[AGENT] Could not clear checkpointer storage for '{thread_id}': {ce}"
-        )
+        logger.warning(f"[AGENT] Could not clear checkpointer for '{thread_id}': {ce}")
+
+
+# ── Tool-name normalisation helper ─────────────────────────────────────────────
+def _norm(name: str) -> str:
+    """Lower-case + strip hyphens/underscores/spaces for fuzzy tool name matching."""
+    return re.sub(r"[-_\s]", "", name.lower())
 
 
 # ── Dynamic prompt helpers ─────────────────────────────────────────────────────
@@ -78,15 +88,15 @@ def _infer_server_capabilities(tool_names: List[str]) -> List[str]:
     name_blob = " ".join(tool_names).lower()
     rules = [
         (["create", "add", "insert", "new"],             "create records"),
-        (["update", "edit", "patch", "modify"],          "update records"),
-        (["delete", "remove", "archive"],                 "delete records"),
+        (["update", "edit", "patch", "modify"],           "update records"),
+        (["delete", "remove", "archive"],                  "delete records"),
         (["list", "get", "fetch", "query", "search",
-          "find", "retrieve"],                            "search & retrieve"),
-        (["send", "email", "message", "notify"],          "send messages"),
-        (["upload", "attach", "file"],                    "file handling"),
-        (["schedule", "event", "calendar", "meeting"],    "calendar / scheduling"),
+          "find", "retrieve"],                             "search & retrieve"),
+        (["send", "email", "message", "notify"],           "send messages"),
+        (["upload", "attach", "file"],                     "file handling"),
+        (["schedule", "event", "calendar", "meeting"],     "calendar / scheduling"),
         (["summarize", "summarise", "analyse", "analyze",
-          "extract"],                                     "AI summarisation"),
+          "extract"],                                      "AI summarisation"),
     ]
     for keywords, label in rules:
         if any(kw in name_blob for kw in keywords):
@@ -107,6 +117,11 @@ def build_dynamic_sifter_prompt(
     all_mcp_tools: Dict[str, list],
     history: List[Dict[str, str]],
 ) -> str:
+    """
+    Classifies the query and identifies which tool groups + task_type are needed.
+    task_type is the key addition: CREATE vs SEARCH vs MIXED drives tool filtering
+    so the agent never wastes steps calling search tools on a creation task.
+    """
     action_group_lines = []
     for server_name, tools in all_mcp_tools.items():
         tool_names = [getattr(t, "name", "") for t in tools]
@@ -122,30 +137,35 @@ def build_dynamic_sifter_prompt(
     recent_topics = _extract_recent_topics(history)
 
     return (
-        "You are a query router for an AI assistant. Classify the user query and "
-        "decide which tool groups are needed to answer it.\n\n"
+        "You are a query router for an AI assistant. Your output is a JSON object "
+        "that tells the agent which tool groups and task type are needed.\n\n"
         "## Available action groups\n"
         f"{action_groups_text}\n\n"
         "## Recent conversation context\n"
         f"{recent_topics}\n\n"
         "## Classification rules\n"
-        "1. 'CONVERSATIONAL' - greetings, small talk, questions about the assistant's "
-        "own capabilities. Use NO tool groups.\n"
-        "2. 'DIRECT_TOOL' - single-step requests that need exactly one server or one "
-        "tool call (e.g. 'list my Notion pages', 'search for X'). Pick the most "
-        "relevant group(s).\n"
-        "3. 'COMPLEX' - multi-step workflows requiring coordination across multiple "
-        "tools or servers. List all needed groups.\n\n"
+        "1. 'CONVERSATIONAL' — greetings, small talk, capability questions. NO tool groups.\n"
+        "2. 'DIRECT_TOOL' — single-step requests needing exactly one server/tool call.\n"
+        "3. 'COMPLEX' — multi-step workflows across multiple tools or servers.\n\n"
+        "## Task-type classification (MANDATORY)\n"
+        "Set 'task_type' to ONE of:\n"
+        "- 'CREATE' — the primary goal is to CREATE, WRITE, POST, or ADD something "
+        "(e.g. 'make a Notion page', 'send an email', 'add a CRM record').\n"
+        "- 'SEARCH' — the primary goal is to READ, FIND, LIST, or RETRIEVE existing data.\n"
+        "- 'MIXED' — the task requires both gathering data AND creating output "
+        "(e.g. 'find jobs and create a Notion page' → MIXED, tool groups include both "
+        "the data source and the creation target).\n\n"
+        "IMPORTANT: When task_type is 'CREATE' or 'MIXED', do NOT include search-only "
+        "tools from the creation server in tool_groups. The agent should call the "
+        "creation tool directly, not pre-search the destination.\n\n"
         "## Real-time data rule (MANDATORY)\n"
-        "If the query asks for information that changes over time - current events, "
-        "today's news, live prices, latest software versions, weather, recent "
-        "announcements, or contains words like 'current', 'latest', 'today', 'now', "
-        "'recent', 'right now', 'live', 'breaking' - you MUST:\n"
-        "  a) include 'Local' in tool_groups (for web search)\n"
-        "  b) NOT classify as CONVERSATIONAL\n\n"
+        "If the query asks for current info (events, prices, news, 'latest', 'today', "
+        "'now', 'recent', 'live', 'breaking'), you MUST include 'Local' in tool_groups "
+        "and NOT classify as CONVERSATIONAL.\n\n"
         f"## User query\n\"{prompt}\"\n\n"
-        "Output ONLY a raw JSON object - no markdown, no explanation:\n"
-        "{\"category\": \"CONVERSATIONAL|DIRECT_TOOL|COMPLEX\", \"tool_groups\": [...]}"
+        "Output ONLY a raw JSON object — no markdown, no explanation:\n"
+        "{\"category\": \"CONVERSATIONAL|DIRECT_TOOL|COMPLEX\", "
+        "\"task_type\": \"CREATE|SEARCH|MIXED\", \"tool_groups\": [...]}"
     )
 
 
@@ -155,45 +175,59 @@ def build_dynamic_planner_prompt(
     all_mcp_tools: Dict[str, list],
 ) -> str:
     """
-    Builds a planner prompt that produces a strict gather → act plan.
-    The plan always ends with an explicit 'CREATE OUTPUT' step so the agent
-    knows to stop collecting data and produce the final result.
+    Generates a strict GATHER → ACT plan.
+    Key changes:
+    - Explicitly lists creation tools separately so the planner always picks the right one.
+    - Mandates that the LAST step is a creation/write tool.
+    - Forbids planning more than 2 data-gather steps for the same source.
     """
     server_lines = []
+    creation_tools = []
     for name in state.get("mcp_servers", {}):
-        tool_count = len(all_mcp_tools.get(name, []))
-        tool_names = [getattr(t, "name", "") for t in all_mcp_tools.get(name, [])]
+        tool_list = all_mcp_tools.get(name, [])
+        tool_count = len(tool_list)
+        tool_names = [getattr(t, "name", "") for t in tool_list]
         sample = ", ".join(tool_names[:5]) + (", ..." if len(tool_names) > 5 else "")
         server_lines.append(f"- {name} ({tool_count} tools: {sample})")
+        # Identify creation tools for this server
+        for tn in tool_names:
+            if any(kw in tn.lower() for kw in ["create", "add", "insert", "send", "post", "write", "new"]):
+                creation_tools.append(f"{tn} (from {name})")
     server_lines.append(
         "- Local tools: web_search, web_scrape, read_uploaded_file, "
         "prepare_file_for_upload, query_documentation"
     )
     servers_text = "\n".join(server_lines)
+    creation_text = "\n".join(f"  • {c}" for c in creation_tools) if creation_tools else "  • (none identified)"
 
     return (
         "You are the Strategic Planning Engine for an AI assistant.\n\n"
         "## Active servers and tools\n"
         f"{servers_text}\n\n"
+        "## Creation tools available (use one as the FINAL step)\n"
+        f"{creation_text}\n\n"
         "## Your task\n"
         f"Generate a precise, ordered execution plan for: \"{query}\"\n\n"
         "## CRITICAL PLANNING RULES\n"
-        "- The plan MUST follow the 'GATHER → ACT' pattern:\n"
-        "  1. First steps: collect all needed data (search/fetch/list)\n"
-        "  2. Final step: create/write/post the output in ONE tool call\n"
-        "- NEVER plan more than 2 data-gathering steps for the same source.\n"
-        "  If the user asks for N items, gather them in at most 2 calls then act.\n"
-        "- The LAST step must always be the 'create output' action "
-        "  (e.g. notion-create-pages, gmail-send, etc.).\n"
-        "- Use ONLY tool names from the list above — never invent tools.\n\n"
+        "1. GATHER → ACT pattern (non-negotiable):\n"
+        "   - Steps 1–N: collect data (search/fetch/list) — at most 2 steps per data source.\n"
+        "   - Final step: call ONE creation/write tool with ALL collected data.\n"
+        "2. The LAST step MUST be a creation tool (create-pages, send, add-record, etc.).\n"
+        "   NEVER end the plan with a search or list tool.\n"
+        "3. If the task says 'N items' (e.g. '10 companies'), gather them in ≤2 calls then act.\n"
+        "   ALL N items must go into the single creation call — never plan partial creation.\n"
+        "4. Do NOT plan a 'search destination before creating' step — e.g. for 'create a "
+        "   Notion page', do NOT include notion-search in the plan.\n"
+        "5. Use ONLY exact tool names from the lists above — never invent tools.\n"
+        "6. The plan must be self-contained and completable in one agent turn. "
+        "   Do NOT design a plan that requires asking the user for permission to continue.\n\n"
         "## Output format — MANDATORY\n"
         "Output ONLY a raw JSON array — no markdown, no explanation:\n"
         "[\n"
         "  {\"step\": 1, \"tool\": \"<exact_tool_name>\", \"purpose\": \"<one sentence>\"},\n"
         "  {\"step\": 2, \"tool\": \"<exact_tool_name>\", \"purpose\": \"<one sentence>\"}\n"
         "]\n\n"
-        "- Steps MUST be in logical execution order.\n"
-        "- Do NOT execute any tools — output the plan only."
+        "Steps MUST be in logical execution order. Do NOT execute any tools — output the plan only."
     )
 
 
@@ -246,9 +280,9 @@ async def compress_history_sandwich(
     else:
         logger.info("[HISTORY COMPRESS] Detecting conversation tone...")
         tone_map = {
-            "technical":  "Use precise technical terminology; preserve tool names, IDs, and specific details.",
-            "casual":     "Use relaxed, plain language; focus on the key points only.",
-            "formal":     "Use professional, concise language; avoid contractions.",
+            "technical": "Use precise technical terminology; preserve tool names, IDs, and specific details.",
+            "casual":    "Use relaxed, plain language; focus on the key points only.",
+            "formal":    "Use professional, concise language; avoid contractions.",
         }
         try:
             tone_res = await _summariser.ainvoke([SystemMessage(
@@ -291,45 +325,133 @@ async def compress_history_sandwich(
     ]
 
 
-# ── MCP tool cache (keyed by server name + url, NOT token) ────────────────────
+# ── MCP tool cache ─────────────────────────────────────────────────────────────
 _MCP_TOOLS_CACHE: Dict[str, list] = {}
 
 
-def _build_anti_loop_instructions(tools_loaded: list) -> str:
+def _build_anti_loop_instructions(tools_loaded: list, plan_steps: list = None) -> str:
     """
-    Returns a block of STOP/ACT rules appended to every agent system prompt.
-    These are the most important lines in the prompt — they prevent the infinite
-    search-paginate-search loop seen in the original recursion-limit crashes.
+    Anti-loop rules appended to every system prompt.
+    Key addition: detects creation tools in the plan and injects a HARD RULE
+    stating the final call MUST be that tool — preventing the agent from
+    spending all its budget on gather steps and never creating.
     """
     tool_names = [getattr(t, "name", str(t)) for t in tools_loaded]
-    tools_str = ", ".join(f"`{n}`" for n in tool_names[:10])
+    tools_str  = ", ".join(f"`{n}`" for n in tool_names[:12])
+
+    # Find the creation tool from the plan (last step's tool)
+    final_tool_rule = ""
+    if plan_steps:
+        last_step = plan_steps[-1] if plan_steps else {}
+        final_tool = last_step.get("tool", "")
+        if final_tool and final_tool != "auto":
+            final_tool_rule = (
+                f"\n### Rule 6 — MANDATORY FINAL CALL\n"
+                f"Your execution plan ends with `{final_tool}`. "
+                f"You MUST call `{final_tool}` as your last tool call, "
+                f"passing ALL data collected in previous steps. "
+                f"If you have called 2 or more gather tools already, "
+                f"go directly to `{final_tool}` — do NOT call any more gather tools.\n"
+            )
+
     return (
         "\n\n---\n"
-        "## ⚠️ MANDATORY EXECUTION RULES — READ BEFORE CALLING ANY TOOL\n\n"
-        "### Rule 1 — GATHER THEN ACT (most important)\n"
-        "Your job has two phases:\n"
-        "  Phase 1 (GATHER): Call data-fetching tools to collect what you need.\n"
-        "  Phase 2 (ACT):    Call the output tool ONCE with ALL collected data.\n"
-        "Never stay in Phase 1 indefinitely. Move to Phase 2 as soon as you have "
-        "enough data — even if it's not perfectly complete.\n\n"
+        "## ⚠️ MANDATORY EXECUTION RULES\n\n"
+        "### Rule 1 — GATHER THEN ACT\n"
+        "Phase 1 (GATHER): Call data-fetching tools to collect what you need.\n"
+        "Phase 2 (ACT):    Call the output/creation tool ONCE with ALL collected data.\n"
+        "Move to Phase 2 as soon as you have enough data — even if imperfect.\n\n"
         "### Rule 2 — NO SAME-TOOL LOOPS\n"
-        f"You have {len(tool_names)} tools available: {tools_str}.\n"
-        "You may call any single tool at most 3 times per response.\n"
-        "If a tool returns a loop-guard warning, STOP calling it immediately "
-        "and proceed to Phase 2 with whatever data you have.\n\n"
+        f"You have tools: {tools_str}\n"
+        f"You may call any single tool at most {MAX_TOOL_CALLS_PER_TURN} times per response.\n"
+        "If you see a loop-guard warning, STOP immediately and move to Phase 2.\n\n"
         "### Rule 3 — QUANTITY REQUESTS\n"
-        "If the user asks for N items (e.g. '10 jobs'), collect up to N items "
-        "across at most 2 search calls, then immediately create the output.\n"
-        "Do NOT paginate beyond page 2 or 3 for any single query.\n\n"
+        "If the user asks for N items, collect them across at most 2 search calls, "
+        "then create the output. Do NOT paginate beyond page 2.\n\n"
         "### Rule 4 — TRUST TRUNCATED RESULTS\n"
-        "If a tool result ends with '[Output truncated ...]', that means you have "
-        "enough data. Do NOT retry the same call to get more — proceed to ACT.\n\n"
+        "If a result ends with '[Output truncated ...]', you have enough data. "
+        "Do NOT retry — proceed to Phase 2 immediately.\n\n"
         "### Rule 5 — ONE CREATION CALL\n"
-        "Calls that create pages, send emails, or post content must happen exactly "
-        "ONCE, containing ALL data gathered in Phase 1. Never split creation across "
-        "multiple tool calls.\n"
+        "Calls that create pages, send emails, or post content happen EXACTLY ONCE, "
+        "containing ALL gathered data. Never split creation across multiple calls.\n"
+        f"{final_tool_rule}"
+        "### Rule 7 — NEVER ASK TO CONTINUE\n"
+        "NEVER end your response with phrases like 'shall I continue?', 'would you like "
+        "me to add more?', 'let me know if you want the rest', or any variation that "
+        "implies the task is incomplete. If the user asked for N items, ALL N items must "
+        "be included in the single creation call before you reply. Do not stop at 2 and "
+        "offer to do the other 8 — do all 10 in one shot.\n"
         "---\n"
     )
+
+
+# ── Task-type aware tool filter ────────────────────────────────────────────────
+_CREATION_KEYWORDS = {"create", "add", "insert", "send", "post", "write", "new", "make"}
+_SEARCH_KEYWORDS   = {"search", "list", "get", "fetch", "query", "find", "retrieve"}
+
+def _filter_tools_by_task_type(
+    tools: list,
+    task_type: str,
+    plan_steps: list,
+) -> list:
+    """
+    When task_type is CREATE or MIXED, removes pure-search tools from the same
+    server as the creation tool — preventing the agent from calling notion-search
+    when its job is to call notion-create-pages.
+
+    Logic:
+    - Identify servers that have a creation tool in the plan.
+    - For those servers, remove any search-only tools.
+    - Always keep tools explicitly named in the plan.
+    """
+    if task_type == "SEARCH":
+        return tools  # no filtering needed for pure search tasks
+
+    # Build set of tool names required by the plan
+    plan_tool_names = {_norm(s.get("tool", "")) for s in plan_steps if s.get("tool")}
+
+    # Identify servers whose creation tools are in the plan
+    creation_servers: set = set()
+    for t in tools:
+        tname = getattr(t, "name", "")
+        if _norm(tname) in plan_tool_names:
+            if any(kw in tname.lower() for kw in _CREATION_KEYWORDS):
+                # Extract a rough "server prefix" (e.g. "notion" from "notion-create-pages")
+                parts = re.split(r"[-_]", tname.lower())
+                if parts:
+                    creation_servers.add(parts[0])
+
+    if not creation_servers:
+        return tools
+
+    filtered = []
+    for t in tools:
+        tname  = getattr(t, "name", "")
+        tnorm  = _norm(tname)
+        tparts = re.split(r"[-_]", tname.lower())
+        server_prefix = tparts[0] if tparts else ""
+
+        # Always keep tools in the plan
+        if tnorm in plan_tool_names:
+            filtered.append(t)
+            continue
+
+        # For servers that have a planned creation tool, drop pure-search tools
+        if server_prefix in creation_servers:
+            is_search_only = (
+                any(kw in tname.lower() for kw in _SEARCH_KEYWORDS)
+                and not any(kw in tname.lower() for kw in _CREATION_KEYWORDS)
+            )
+            if is_search_only:
+                logger.info(
+                    f"[TOOL FILTER] Dropping search-only tool '{tname}' "
+                    f"(server '{server_prefix}' has a planned creation tool)."
+                )
+                continue
+
+        filtered.append(t)
+
+    return filtered
 
 
 async def stream_agent_interaction(
@@ -339,29 +461,26 @@ async def stream_agent_interaction(
     thread_id: str = "default",
 ) -> AsyncGenerator[str, None]:
     """
-    Streams the ReAct agent's thoughts, tool invocations, and final response
-    back to the frontend via Server-Sent Events (SSE).
+    Streams the agent's reasoning and final response via Server-Sent Events (SSE).
     """
-    llm_inst = get_llm()
+    llm_inst   = get_llm()
+    cheap_llm  = get_cheap_llm()
 
-    # ── 0. Decide input messages based on thread state ─────────────────────────
+    # ── 0. Build message list ──────────────────────────────────────────────────
     is_new_thread = thread_id not in _INITIALIZED_THREADS
-
-    cheap_llm = get_cheap_llm()
     compressed_history = await compress_history_sandwich(history, llm_inst, cheap_llm_inst=cheap_llm)
 
     if is_new_thread:
         msgs = []
         for h in compressed_history:
-            role    = h.get("role")
-            content = h.get("content", "")
+            role, content = h.get("role"), h.get("content", "")
             if role == "user":
                 msgs.append(HumanMessage(content=content))
             elif role == "assistant":
                 msgs.append(AIMessage(content=content))
         msgs.append(HumanMessage(content=prompt))
         _INITIALIZED_THREADS.add(thread_id)
-        logger.info(f"[AGENT] New thread '{thread_id}' — seeding with {len(msgs)} messages.")
+        logger.info(f"[AGENT] New thread '{thread_id}' — seeding {len(msgs)} messages.")
     else:
         msgs = [HumanMessage(content=prompt)]
         logger.info(f"[AGENT] Existing thread '{thread_id}' — passing new message only.")
@@ -374,8 +493,7 @@ async def stream_agent_interaction(
         servers_to_fetch = {}
         for name, s in state["mcp_servers"].items():
             from urllib.parse import urlparse
-            _raw_url = s.get("url", "")
-            _p = urlparse(_raw_url)
+            _p = urlparse(s.get("url", ""))
             _clean_url = f"{_p.scheme}://{_p.netloc}{_p.path}"
             srv_key = f"{name}:{_clean_url}"
             if srv_key in _MCP_TOOLS_CACHE:
@@ -389,6 +507,7 @@ async def stream_agent_interaction(
             for name, (s, srv_key) in servers_to_fetch.items():
                 transport = s.get("transport", "streamable_http")
                 cfg = _make_cfg(s["url"], s["auth_type"], s["auth_value"], transport=transport)
+                logger.info(f"[MCP] Config for {name}: headers = {cfg.get('headers', {})}")
                 if s.get("api_header") and s.get("auth_type") == "api_key":
                     cfg["headers"] = {s["api_header"]: s["auth_value"]}
                 configs[name] = cfg
@@ -406,13 +525,15 @@ async def stream_agent_interaction(
 
             await asyncio.gather(*[_fetch_one(n) for n in configs.keys()])
 
-    # ── 2. Smart Sifter ────────────────────────────────────────────────────────
+    # ── 2. Sifter ─────────────────────────────────────────────────────────────
     total_input_tokens  = 0
     total_output_tokens = 0
     needs_plan  = True
     needs_tools = True
     tool_groups = []
     plan_text   = ""
+    plan_steps  = []
+    task_type   = "MIXED"    # default — safe for both CREATE and MIXED tasks
 
     _TRIVIAL_PHRASES = {
         "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "ok thanks",
@@ -424,129 +545,102 @@ async def stream_agent_interaction(
         needs_plan = needs_tools = False
         tool_groups = []
         plan_text = "Pure conversational small talk."
-        logger.info(f"[PLANNER] Trivial query fast-path — skipping sifter LLM call.")
+        logger.info("[PLANNER] Trivial query fast-path — skipping sifter LLM call.")
     else:
-      try:
-        server_descriptions = ""
-        for name, mcp_tools in all_mcp_tools.items():
-            tool_names    = [getattr(t, "name", "") for t in mcp_tools]
-            tools_summary = ", ".join(tool_names[:6])
-            if len(tool_names) > 6:
-                tools_summary += f", and {len(tool_names) - 6} more"
-            server_descriptions += f"- '{name}': {tools_summary}.\n"
+        try:
+            classification_prompt = build_dynamic_sifter_prompt(prompt, all_mcp_tools, history)
 
-        for srv_name in state.get("mcp_servers", {}).keys():
-            if srv_name not in all_mcp_tools:
-                server_descriptions += f"- '{srv_name}': Connected server (tools loading).\n"
+            sifter_hash = hashlib.sha256(
+                f"{prompt.lower().strip()}:{','.join(sorted(all_mcp_tools.keys()))}".encode()
+            ).hexdigest()[:32]
 
-        classification_prompt = build_dynamic_sifter_prompt(prompt, all_mcp_tools, history)
-
-        sifter_hash = hashlib.sha256(
-            f"{prompt.lower().strip()}:{server_descriptions}".encode()
-        ).hexdigest()[:32]
-
-        cached_sifter = await cache.get_sifter(sifter_hash)
-        if cached_sifter:
-            category    = cached_sifter.get("category", "COMPLEX")
-            tool_groups = cached_sifter.get("tool_groups", [])
-            logger.info(f"[PLANNER] Sifter cache hit: {category} | {tool_groups}")
-        else:
-            class_res = await cheap_llm.ainvoke([SystemMessage(content=classification_prompt)])
-            if getattr(class_res, "usage_metadata", None):
-                total_input_tokens  += class_res.usage_metadata.get("input_tokens", 0)
-                total_output_tokens += class_res.usage_metadata.get("output_tokens", 0)
+            cached_sifter = await cache.get_sifter(sifter_hash)
+            if cached_sifter:
+                category    = cached_sifter.get("category", "COMPLEX")
+                tool_groups = cached_sifter.get("tool_groups", [])
+                task_type   = cached_sifter.get("task_type", "MIXED")
+                logger.info(f"[PLANNER] Sifter cache hit: {category} | {task_type} | {tool_groups}")
             else:
-                total_input_tokens  += count_tokens(classification_prompt)
-                total_output_tokens += count_tokens(class_res.content)
+                class_res = await cheap_llm.ainvoke([SystemMessage(content=classification_prompt)])
+                if getattr(class_res, "usage_metadata", None):
+                    total_input_tokens  += class_res.usage_metadata.get("input_tokens", 0)
+                    total_output_tokens += class_res.usage_metadata.get("output_tokens", 0)
+                else:
+                    total_input_tokens  += count_tokens(classification_prompt)
+                    total_output_tokens += count_tokens(class_res.content)
 
-            cleaned_text = re.sub(r"```json\s*|\s*```", "", class_res.content.strip()).strip()
-            try:
-                meta        = json.loads(cleaned_text)
-                category    = meta.get("category", "COMPLEX").strip().upper()
-                tool_groups = [g.strip() for g in meta.get("tool_groups", [])]
-                await cache.set_sifter(sifter_hash, {"category": category, "tool_groups": tool_groups})
-            except Exception:
-                category    = "COMPLEX"
-                tool_groups = list(state.get("mcp_servers", {}).keys()) + ["Local"]
+                cleaned_text = re.sub(r"```json\s*|\s*```", "", class_res.content.strip()).strip()
+                try:
+                    meta        = json.loads(cleaned_text)
+                    category    = meta.get("category", "COMPLEX").strip().upper()
+                    tool_groups = [g.strip() for g in meta.get("tool_groups", [])]
+                    task_type   = meta.get("task_type", "MIXED").strip().upper()
+                    if task_type not in ("CREATE", "SEARCH", "MIXED"):
+                        task_type = "MIXED"
+                    await cache.set_sifter(sifter_hash, {
+                        "category": category,
+                        "tool_groups": tool_groups,
+                        "task_type": task_type,
+                    })
+                except Exception:
+                    category    = "COMPLEX"
+                    tool_groups = list(state.get("mcp_servers", {}).keys()) + ["Local"]
+                    task_type   = "MIXED"
 
-            logger.info(f"[PLANNER] Sifter decision: {category} | {tool_groups}")
+                logger.info(f"[PLANNER] Sifter decision: {category} | task_type={task_type} | {tool_groups}")
 
-        _REALTIME_KEYWORDS = {
-            "current", "currently", "today", "now", "latest", "recent", "recently",
-            "right now", "live", "breaking", "this week", "this month", "this year",
-            "2024", "2025", "2026", "news", "price", "stock", "weather", "update",
-        }
-        _prompt_tokens = set(prompt.lower().replace("?", "").replace(",", "").split())
-        if _prompt_tokens & _REALTIME_KEYWORDS:
-            if "Local" not in tool_groups:
-                tool_groups.append("Local")
-            if "CONVERSATIONAL" in category:
-                category = "DIRECT_TOOL"
-            logger.info(f"[PLANNER] Real-time keyword override applied → {category} | {tool_groups}")
-
-        if "CONVERSATIONAL" in category:
-            needs_plan = needs_tools = False
-            plan_text = "Pure conversational small talk."
-        elif "DIRECT_TOOL" in category:
-            needs_plan  = False
-            needs_tools = True
-            plan_text = "Direct tool execution."
-        else:
-            needs_plan = needs_tools = True
-
-        _mcp_groups = [g for g in tool_groups if g != "Local"]
-        if len(_mcp_groups) > 1 and "CONVERSATIONAL" not in category:
-            _explicit_mentions = [g for g in _mcp_groups if g.lower() in prompt.lower()]
-            if not _explicit_mentions:
-                service_list = ", ".join(_mcp_groups)
-                clarify_msg = (
-                    f"I found multiple services that could answer this — {service_list}. "
-                    "Which one should I use?"
-                )
-                logger.info(f"[PLANNER] Ambiguous query — clarification needed: {_mcp_groups}")
-                yield f"event: clarification\ndata: {json.dumps({'text': clarify_msg, 'options': _mcp_groups})}\n\n"
-                return
-
-      except Exception as sifter_err:
-        logger.error(f"[PLANNER ERROR] Sifter failed: {sifter_err}")
-        needs_plan = needs_tools = True
-        tool_groups = list(state.get("mcp_servers", {}).keys()) + ["Local"]
-
-        if state.get("mcp_servers"):
-            from urllib.parse import urlparse as _up
-            missing = {
-                name: s
-                for name, s in state["mcp_servers"].items()
-                if name not in all_mcp_tools
+            # Real-time keyword override
+            _REALTIME_KEYWORDS = {
+                "current", "currently", "today", "now", "latest", "recent", "recently",
+                "right now", "live", "breaking", "this week", "this month", "this year",
+                "2024", "2025", "2026", "news", "price", "stock", "weather", "update",
             }
-            if missing:
-                logger.info(f"[PLANNER FALLBACK] Re-fetching tools for: {list(missing.keys())}")
-                for name, s in missing.items():
-                    try:
-                        _p = _up(s.get("url", ""))
-                        srv_key = f"{name}:{_p.scheme}://{_p.netloc}{_p.path}"
-                        transport = s.get("transport", "streamable_http")
-                        cfg = _make_cfg(s["url"], s["auth_type"], s["auth_value"], transport=transport)
-                        single_client = MultiServerMCPClient({name: cfg})
-                        mcp_tools = await single_client.get_tools()
-                        _MCP_TOOLS_CACHE[srv_key] = mcp_tools
-                        all_mcp_tools[name] = mcp_tools
-                        logger.info(f"[PLANNER FALLBACK] Re-fetched {len(mcp_tools)} tools from '{name}'.")
-                    except Exception as refetch_err:
-                        logger.error(f"[PLANNER FALLBACK] Re-fetch still failed for '{name}': {refetch_err}")
+            _prompt_tokens = set(prompt.lower().replace("?", "").replace(",", "").split())
+            if _prompt_tokens & _REALTIME_KEYWORDS:
+                if "Local" not in tool_groups:
+                    tool_groups.append("Local")
+                if "CONVERSATIONAL" in category:
+                    category = "DIRECT_TOOL"
+                logger.info(f"[PLANNER] Real-time keyword override → {category} | {tool_groups}")
+
+            if "CONVERSATIONAL" in category:
+                needs_plan = needs_tools = False
+                plan_text = "Pure conversational small talk."
+            elif "DIRECT_TOOL" in category:
+                needs_plan  = False
+                needs_tools = True
+                plan_text = "Direct tool execution."
+            else:
+                needs_plan = needs_tools = True
+
+            # Multi-service ambiguity check
+            _mcp_groups = [g for g in tool_groups if g != "Local"]
+            if len(_mcp_groups) > 1 and "CONVERSATIONAL" not in category:
+                _explicit_mentions = [g for g in _mcp_groups if g.lower() in prompt.lower()]
+                if not _explicit_mentions:
+                    service_list = ", ".join(_mcp_groups)
+                    clarify_msg = (
+                        f"I found multiple services that could help — {service_list}. "
+                        "Which one should I use?"
+                    )
+                    logger.info(f"[PLANNER] Ambiguous query — clarification: {_mcp_groups}")
+                    yield f"event: clarification\ndata: {json.dumps({'text': clarify_msg, 'options': _mcp_groups})}\n\n"
+                    return
+
+        except Exception as sifter_err:
+            logger.error(f"[PLANNER ERROR] Sifter failed: {sifter_err}")
+            needs_plan = needs_tools = True
+            tool_groups = list(state.get("mcp_servers", {}).keys()) + ["Local"]
+            task_type = "MIXED"
 
     # ── 3. Resolve tools ───────────────────────────────────────────────────────
-    # Per-turn call counter — shared mutable dict passed into every tool wrapper
-    # so the loop-guard can count calls across all tools in this one agent turn.
     turn_call_counter: Dict[str, int] = {}
-
     tools = []
 
     if needs_tools:
         for name in tool_groups:
             for server_name in all_mcp_tools:
                 if name.lower() in server_name.lower() or server_name.lower() in name.lower():
-                    # Pass the per-turn counter into each wrapper so loop-guard works
                     tools.extend([
                         wrap_tool_with_coercion(t, call_counter=turn_call_counter)
                         for t in all_mcp_tools[server_name]
@@ -567,9 +661,6 @@ async def stream_agent_interaction(
 
         if tools:
             from database import retrieve_relevant_tools
-            # ── Tool RAG with SSE keepalive ───────────────────────────────────
-            # Embedding 50+ tools takes 9-15s. Without heartbeats the frontend
-            # SSE connection times out before the agent even starts.
             yield "event: thought\ndata: {\"text\": \"🔍 Selecting best tools for this task...\"}\n\n"
             rag_task = asyncio.create_task(
                 retrieve_relevant_tools(prompt, tools, top_k=8)
@@ -578,32 +669,21 @@ async def stream_agent_interaction(
                 yield "event: keepalive\ndata: {}\n\n"
                 await asyncio.sleep(2)
             tools = rag_task.result()
-            # Pin tools explicitly named in the plan — RAG may miss low-scoring
-            # but mandatory tools like notion-create-pages.
-            if plan_text:
-                pinned_names = set(re.findall(r"\[([^\]]+)\]", plan_text))
-                active_names = {getattr(t, "name", "") for t in tools}
-                full_pool = [t for lst in all_mcp_tools.values() for t in lst]
-                for t in full_pool:
-                    tname = getattr(t, "name", "")
-                    if tname in pinned_names and tname not in active_names:
-                        logger.info(f"[TOOL RAG] Pinning plan-required tool: {tname}")
-                        tools.append(wrap_tool_with_coercion(t, call_counter=turn_call_counter))
 
-    # ── 4. Strategic Planning Phase ───────────────────────────────────────────
+    # ── 4. Strategic Planning ─────────────────────────────────────────────────
     if needs_plan:
-        logger.info("[PLANNER] Running pre-execution strategic planning...")
-        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Creating strategic execution plan...'})}\n\n"
+        logger.info("[PLANNER] Running strategic planning...")
+        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Building execution plan...'})}\n\n"
 
         try:
             planning_system_prompt = build_dynamic_planner_prompt(prompt, state, all_mcp_tools)
             planning_msgs = [SystemMessage(content=planning_system_prompt)]
             for h in (compressed_history if is_new_thread else history[-3:]):
                 r = h.get("role"); c = h.get("content", "")
-                if r == "user":      planning_msgs.append(HumanMessage(content=c))
+                if r == "user":       planning_msgs.append(HumanMessage(content=c))
                 elif r == "assistant": planning_msgs.append(AIMessage(content=c))
             planning_msgs.append(HumanMessage(
-                content=f"Generate a strategic execution plan (TODO list) for: '{prompt}'"
+                content=f"Generate a strategic execution plan for: '{prompt}'"
             ))
 
             plan_response = await cheap_llm.ainvoke(planning_msgs)
@@ -611,7 +691,7 @@ async def stream_agent_interaction(
                 total_input_tokens  += plan_response.usage_metadata.get("input_tokens", 0)
                 total_output_tokens += plan_response.usage_metadata.get("output_tokens", 0)
 
-            raw_plan  = plan_response.content if hasattr(plan_response, "content") else str(plan_response)
+            raw_plan   = plan_response.content if hasattr(plan_response, "content") else str(plan_response)
             plan_steps = _parse_structured_plan(raw_plan)
 
             plan_text = "\n".join(
@@ -626,46 +706,66 @@ async def stream_agent_interaction(
             yield f"event: thought\ndata: {json.dumps({'text': f'📋 **Execution Plan:**\n{display_plan}'})}\n\n"
         except Exception as plan_err:
             logger.error(f"[PLANNER ERROR] {plan_err}")
-            plan_text = "Step 1: Directly process request using available tools."
+            plan_text  = "Step 1: Directly process request using available tools."
+            plan_steps = [{"step": 1, "tool": "auto", "purpose": plan_text}]
 
-    # ── 5. Build system prompt ─────────────────────────────────────────────────
+    # ── 5. Pin plan tools + task-type filtering ────────────────────────────────
+    if plan_steps and tools:
+        # Normalised pin: fuzzy-match plan tool names against full pool
+        pinned_norms   = {_norm(s.get("tool", "")) for s in plan_steps if s.get("tool") and s.get("tool") != "auto"}
+        active_norms   = {_norm(getattr(t, "name", "")) for t in tools}
+        full_pool      = [t for lst in all_mcp_tools.values() for t in lst]
+
+        for t in full_pool:
+            tname = getattr(t, "name", "")
+            tnorm = _norm(tname)
+            if tnorm in pinned_norms and tnorm not in active_norms:
+                logger.info(f"[TOOL RAG] Pinning plan-required tool: {tname}")
+                tools.append(wrap_tool_with_coercion(t, call_counter=turn_call_counter))
+                active_norms.add(tnorm)
+
+        # Remove search-only tools when destination server has a creation tool planned
+        tools = _filter_tools_by_task_type(tools, task_type, plan_steps)
+
+    # ── 6. Build system prompt ─────────────────────────────────────────────────
     base_prompt = build_system_prompt(state, active_groups=tool_groups)
-    anti_loop   = _build_anti_loop_instructions(tools)
+    anti_loop   = _build_anti_loop_instructions(tools, plan_steps=plan_steps)
 
     _search_instruction = (
-        "After calling web_search or web_scrape, always present the results as a "
-        "concise, readable summary — highlight key facts, dates, and names. "
-        "Never dump raw snippets or URLs as the final answer.\n\n"
+        "After calling web_search or web_scrape, present results as a clean markdown "
+        "summary — highlight key facts, dates, and names. Never dump raw snippets.\n\n"
     )
+
     if needs_plan:
         system_prompt = (
             f"{base_prompt}\n\n"
             f"{_search_instruction}"
-            f"### STRATEGIC PLAN — execute steps in this exact order:\n{plan_text}\n\n"
-            "Use your tools as dictated by the plan. When scraping websites, extract details "
-            "via LLM context — do not use regex. Enrich CRM with discovered data."
+            f"### Execution Plan — follow steps in this exact order:\n{plan_text}\n\n"
+            "Execute steps using your tools. When scraping, extract details via LLM context.\n"
             f"{anti_loop}"
         )
     elif needs_tools:
         system_prompt = (
             f"{base_prompt}\n\n"
             f"{_search_instruction}"
-            "Respond directly or execute required tools immediately. "
-            "If tools are needed, call them. Otherwise give a clear direct response."
+            "Execute required tools immediately. If tools are needed, call them. "
+            "Otherwise give a clear direct response.\n"
             f"{anti_loop}"
         )
     else:
         system_prompt = (
-            "You are a friendly, helpful AI productivity assistant. "
-            "Respond to the user's greeting or chat in a brief and pleasant manner."
+            "You are Antigravity, a friendly and helpful AI assistant. "
+            "Respond to the user's message in a warm, conversational tone."
         )
 
-    # ── 6. Execute agent ───────────────────────────────────────────────────────
-    logger.info(f"[AGENT] Streaming with thread_id='{thread_id}', tools={len(tools)}, recursion_limit={AGENT_RECURSION_LIMIT}")
+    # ── 7. Execute agent ───────────────────────────────────────────────────────
+    logger.info(
+        f"[AGENT] Streaming thread='{thread_id}', tools={len(tools)}, "
+        f"task_type={task_type}, recursion_limit={AGENT_RECURSION_LIMIT}"
+    )
     if needs_plan:
-        yield f"event: thought\ndata: {json.dumps({'text': '🧠 Executing plan with dynamic tools...'})}\n\n"
+        yield f"event: thought\ndata: {json.dumps({'text': '⚡ Executing plan...'})}\n\n"
 
-    # recursion_limit lives in the top-level config, not inside configurable.
     thread_config = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": AGENT_RECURSION_LIMIT,
@@ -676,11 +776,11 @@ async def stream_agent_interaction(
             agent = create_react_agent(
                 llm_inst,
                 tools,
-                prompt=system_prompt,
+                 prompt=system_prompt,
                 checkpointer=checkpointer,
             )
 
-            # ── Pre-flight: heal dangling tool calls ──────────────────────────
+            # Pre-flight: heal dangling tool calls
             if thread_id in _INITIALIZED_THREADS:
                 try:
                     cp_tuple = await checkpointer.aget_tuple(
@@ -712,16 +812,12 @@ async def stream_agent_interaction(
                             msgs = []
                             for h in compressed_history:
                                 role = h.get("role"); content = h.get("content", "")
-                                if role == "user":
-                                    msgs.append(HumanMessage(content=content))
-                                elif role == "assistant":
-                                    msgs.append(AIMessage(content=content))
+                                if role == "user":      msgs.append(HumanMessage(content=content))
+                                elif role == "assistant": msgs.append(AIMessage(content=content))
                             msgs.append(HumanMessage(content=prompt))
                             _INITIALIZED_THREADS.add(thread_id)
                 except Exception as pre_err:
-                    logger.warning(
-                        f"[AGENT] Pre-flight checkpoint check failed (non-fatal): {pre_err}"
-                    )
+                    logger.warning(f"[AGENT] Pre-flight check failed (non-fatal): {pre_err}")
 
             async for chunk in agent.astream({"messages": msgs}, config=thread_config):
                 if "agent" in chunk:
@@ -755,25 +851,23 @@ async def stream_agent_interaction(
             total_output_tokens += count_tokens(full_response)
 
         yield f"event: token_usage\ndata: {json.dumps({'input_tokens': total_input_tokens, 'output_tokens': total_output_tokens})}\n\n"
-        yield f"event: thought\ndata: {json.dumps({'text': '✅ Completed successfully'})}\n\n"
+        yield f"event: thought\ndata: {json.dumps({'text': '✅ Done!'})}\n\n"
 
     except Exception as e:
         err_str = str(e)
         if "AIMessages with tool_calls" in err_str or "INVALID_CHAT_HISTORY" in err_str:
             logger.warning(
-                f"[AGENT] INVALID_CHAT_HISTORY in thread '{thread_id}' — "
-                "resetting checkpoint so next message auto-heals."
+                f"[AGENT] INVALID_CHAT_HISTORY in thread '{thread_id}' — resetting checkpoint."
             )
             _reset_thread_checkpoint(thread_id)
             yield (
-                f"event: error\ndata: {json.dumps({'message': 'Your conversation history was reset after an interrupted tool call. Please resend your last message and the agent will continue normally.'})}\n\n"
+                f"event: error\ndata: {json.dumps({'message': 'Your conversation history was reset after an interrupted tool call. Please resend your last message.'})}\n\n"
             )
             return
-        # Recursion limit hit — surface a clear, friendly message
         if "recursion" in err_str.lower() or "GRAPH_RECURSION_LIMIT" in err_str:
             logger.error(f"[AGENT] Recursion limit ({AGENT_RECURSION_LIMIT}) hit for thread '{thread_id}'.")
             yield (
-                f"event: error\ndata: {json.dumps({'message': f'The task required too many steps to complete automatically. Try breaking it into smaller parts, or be more specific about what you need (e.g. specify the exact service to use).'})}\n\n"
+                f"event: error\ndata: {json.dumps({'message': 'This task required too many steps. Try breaking it into smaller parts or be more specific about which service to use.'})}\n\n"
             )
             return
         logger.error(f"[CHAT ERROR] {e}", exc_info=True)

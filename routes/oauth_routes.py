@@ -116,9 +116,17 @@ KNOWN_OAUTH_SERVERS = {
 # Helper utilities
 
 async def _try_connect_mcp(server_name: str, url: str, auth_type: str, auth_value: str, extra_headers: Optional[Dict[str, str]] = None):
-    """Try connecting to an MCP server with transport fallback: streamable_http -> sse."""
+    """
+    Try connecting to an MCP server with transport fallback: streamable_http -> sse.
+
+    Raises:
+        PermissionError: If the server returns 403 Forbidden — the OAuth token is valid
+                         but the app is not approved for this MCP API.
+        RuntimeError:    If connection fails for any other reason.
+    """
     from langchain_mcp_adapters.client import MultiServerMCPClient
-    
+
+    last_errors = []
     for transport in ["streamable_http", "sse"]:
         try:
             cfg = _make_cfg(url, auth_type, auth_value, transport=transport)
@@ -126,12 +134,28 @@ async def _try_connect_mcp(server_name: str, url: str, auth_type: str, auth_valu
                 cfg["headers"] = {**cfg.get("headers", {}), **extra_headers}
             client = MultiServerMCPClient({server_name: cfg})
             tools = await client.get_tools()
-            logger.info(f"[MCP CONNECT] Connected to '{server_name}' via {transport} transport ({len(tools)} tools).")
+            logger.info(f"[MCP CONNECT] Connected to '{server_name}' via {transport} ({len(tools)} tools).")
             return tools, transport
         except Exception as e:
+            err_str = str(e)
             logger.info(f"[MCP CONNECT] {transport} failed for '{server_name}': {e}")
+            # Detect 403 Forbidden immediately — no point trying the other transport
+            if "403" in err_str or "Forbidden" in err_str or "forbidden" in err_str:
+                raise PermissionError(
+                    f"Authorization succeeded but '{server_name}' returned 403 Forbidden when "
+                    f"connecting to the MCP API at {url}. "
+                    f"This usually means the app has not been approved for MCP API access by {server_name}. "
+                    f"Steps to fix: (1) Check that your {server_name} developer app has the correct MCP scopes. "
+                    f"(2) Apply for MCP API access approval from {server_name}. "
+                    f"(3) Ensure the OAuth app is not in 'unreviewed' / sandbox mode."
+                )
+            last_errors.append(err_str)
             continue
-    raise RuntimeError(f"Could not connect to MCP server '{server_name}' via any transport (tried streamable_http, sse).")
+
+    raise RuntimeError(
+        f"Could not connect to MCP server '{server_name}' via any transport "
+        f"(tried streamable_http, sse). Last errors: {'; '.join(last_errors)}"
+    )
 
 def _get_unique_server_name(base_name: str, current_url: str, state: Dict[str, Any]) -> str:
     """
@@ -732,6 +756,15 @@ async def oauth_callback(code: str, state: str):
 
         logger.info(f"[OAUTH SUCCESS] Successfully connected server '{server_name}'.")
         return RedirectResponse(url=f"http://localhost:8501/?oauth_success=1&server_name={quote(server_name)}")
+    except PermissionError as pe:
+        # 403 from the MCP endpoint — OAuth worked but app is not approved for MCP access
+        logger.error(f"[OAUTH CALLBACK] MCP access denied (403) for '{flow.get('name', 'unknown')}': {pe}")
+        friendly = (
+            f"Connected to {flow.get('name', 'the service')} but MCP API access was denied (403 Forbidden). "
+            f"Your OAuth credentials are valid, but this app has not been approved for MCP API access. "
+            f"Please apply for MCP API access in your {flow.get('name', '')} developer portal and try again."
+        )
+        return RedirectResponse(url=f"http://localhost:8501/?oauth_error={quote(friendly)}&oauth_error_type=permission_denied")
     except Exception as e:
         logger.error(f"[OAUTH CALLBACK ERROR] OAuth callback failed: {e}")
         return RedirectResponse(url=f"http://localhost:8501/?oauth_error={quote(str(e))}")

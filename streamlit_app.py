@@ -102,9 +102,35 @@ if "oauth_success" in query_params:
     load_session_data()
     st.rerun()
 elif "oauth_error" in query_params:
-    st.error(f"OAuth Flow Failed: {query_params['oauth_error']}")
+    error_msg = query_params.get("oauth_error", "Unknown error")
+    error_type = query_params.get("oauth_error_type", "")
     st.query_params.clear()
-    st.rerun()
+
+    if error_type == "permission_denied" or "403" in error_msg or "permission" in error_msg.lower() or "forbidden" in error_msg.lower():
+        st.error("⛔ MCP API Access Denied (403 Forbidden)")
+        st.warning(
+            "**Your OAuth login succeeded**, but the service blocked MCP API access.\n\n"
+            "**Why this happens:**\n"
+            "- Your developer app has not been approved for MCP API access by this provider.\n"
+            "- The app is still in 'unreviewed' / sandbox mode.\n\n"
+            "**How to fix it:**\n"
+            "1. Go to your developer portal for this service.\n"
+            "2. Apply for MCP API access or request app review/approval.\n"
+            "3. Once approved, try connecting again from the sidebar.\n\n"
+            f"*Technical detail: {error_msg}*"
+        )
+    elif "session_expired" in error_msg:
+        st.error("⏰ OAuth Session Expired")
+        st.info("The authorization session timed out. Please try connecting again from the sidebar.")
+    else:
+        st.error("❌ Connection Failed")
+        st.warning(
+            f"Could not complete the OAuth connection.\n\n"
+            f"**Error:** {error_msg}\n\n"
+            "Please try connecting again. If the problem persists, check that your "
+            "MCP server URL and credentials are correct."
+        )
+    # Do NOT call st.rerun() here — that clears the error before the user reads it
 
 # ── Sidebar Resource Manager ─────────────────────────────────────────────────
 with st.sidebar:

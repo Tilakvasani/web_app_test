@@ -176,7 +176,7 @@ def wrap_tool_with_coercion(tool_inst: BaseTool, call_counter: Dict[str, int] = 
     - Loop guard: if call_counter is provided, tracks per-tool call counts and
       returns an early-stop message after MAX_CALLS_PER_TOOL_PER_TURN calls.
     """
-    MAX_CALLS_PER_TOOL_PER_TURN = 3
+    MAX_CALLS_PER_TOOL_PER_TURN = 2   # Lowered 3→2: hit guardrail faster, save budget for creation step
 
     async def coerced_coroutine(**kwargs):
         # ── Loop guard: prevent infinite same-tool retries ────────────────────
